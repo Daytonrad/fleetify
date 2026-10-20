@@ -9,7 +9,7 @@
  * This eliminates the browser-style mic permission popup on Windows because
  * cpal uses the OS WASAPI API directly (trusted desktop-app context).
  */
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { voice, type VoiceEngine } from "@/lib/voice-api";
 
@@ -58,17 +58,94 @@ export function getVoicePrefs(): VoicePrefs {
   };
 }
 
+/** Fired after every pref write. Settings is a sibling route that does NOT
+ *  unmount the composer, so a mount-time read would never see the change. */
+export const VOICE_PREFS_EVENT = "fleet:voice-prefs";
+
 export function setVoicePref(key: keyof typeof LS, value: string) {
   try { localStorage.setItem(LS[key], value); } catch { /* private mode */ }
+  try { window.dispatchEvent(new CustomEvent(VOICE_PREFS_EVENT)); } catch { /* no DOM */ }
 }
 
-/** Whether dictation can actually run with the current prefs. False when the
- *  on-device ("local") engine is selected but no local model is chosen — the
- *  mic would only ever error with NO_MODEL, so we disable it up front. Every
- *  other engine ("auto"/"broker"/"byok") doesn't require a downloaded model. */
-export function isVoiceReady(): boolean {
-  const { engine, model } = getVoicePrefs();
-  return engine !== "local" || model.trim() !== "";
+/** Whether dictation can run right now, and why not when it can't. */
+export interface VoiceReadiness {
+  ready: boolean;
+  /** Hover text for the disabled mic. Null while ready. */
+  reason: string | null;
+}
+
+const READY:    VoiceReadiness = { ready: true,  reason: null };
+const CHECKING: VoiceReadiness = { ready: false, reason: "Checking the on-device voice model…" };
+const NO_MODEL: VoiceReadiness = {
+  ready: false,
+  reason: "Voice model not installed — download an on-device model in Settings → Voice",
+};
+const NO_ENGINE: VoiceReadiness = {
+  ready: false,
+  reason: "This build has no on-device voice engine — pick another engine in Settings → Voice",
+};
+
+/**
+ * Readiness of the current voice prefs.
+ *
+ * Only the on-device ("local") engine can be dead on arrival: it needs a
+ * downloaded Whisper model, and Settings persists a model *id* the moment you
+ * pick the engine — before anything is on disk — so the pref string alone
+ * proves nothing. Rust falls back to any downloaded model
+ * (`src-tauri/src/shell/voice/models.rs::resolve_model_path`), so "at least
+ * one downloaded" is the exact condition; anything less only ever yields a
+ * NO_MODEL error after the user has already spoken.
+ *
+ * "auto" / "broker" / "byok" never require a local model — they're ready
+ * immediately and never touch the IPC.
+ */
+export function useVoiceReady(): VoiceReadiness {
+  const [state, setState] = useState<VoiceReadiness>(
+    () => (getVoicePrefs().engine === "local" ? CHECKING : READY),
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    let lastEngine: VoiceEngine | null = null;
+
+    /** `force` re-runs the IPC even when the engine is unchanged — used when a
+     *  download finishes or the window regains focus. The engine guard exists
+     *  because Settings writes a pref on every keystroke of the vocabulary
+     *  hint, and those must not each cost a round-trip. */
+    const check = (force: boolean) => {
+      const { engine } = getVoicePrefs();
+      const changed = engine !== lastEngine;
+      lastEngine = engine;
+      if (!changed && !force) return;
+      if (engine !== "local") { setState(READY); return; }
+      if (changed) setState(CHECKING);
+      voice
+        .listModels()
+        .then((r) => {
+          if (cancelled) return;
+          if (!r.supported) { setState(NO_ENGINE); return; }
+          setState(r.models.some((m) => m.downloaded) ? READY : NO_MODEL);
+        })
+        .catch(() => { if (!cancelled) setState(NO_MODEL); });
+    };
+
+    check(true);
+    const onPrefs = () => check(false);
+    const onFocus = () => check(true);
+    // A download finishing while Settings is open has to re-enable the mic
+    // underneath it — the composer never unmounted, so nothing else would.
+    const off = voice.onModelProgress((p) => { if (p.done) check(true); });
+    window.addEventListener(VOICE_PREFS_EVENT, onPrefs);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      off();
+      window.removeEventListener(VOICE_PREFS_EVENT, onPrefs);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+
+  return state;
 }
 
 type State = "idle" | "recording" | "transcribing";

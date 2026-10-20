@@ -19,7 +19,7 @@ import { FleetModeChip } from "./fleet-mode-chip";
 import { wsManager } from "@/services/ws-manager";
 import { FileMentionPopup } from "./file-mention-popup";
 import { BranchStrip, computeBranchName } from "@/components/git/branch-strip";
-import { useVoiceDictation, isVoiceReady } from "@/hooks/use-voice-dictation";
+import { useVoiceDictation, useVoiceReady } from "@/hooks/use-voice-dictation";
 import { voice } from "@/lib/voice-api";
 import { useAppStore } from "@/stores/app-store";
 import { useChatStore, pushChatError } from "@/stores/chat-store";
@@ -334,7 +334,7 @@ function Kbd({ children }: { children: React.ReactNode }) {
 function ToolBtn({ children, title, onClick, disabled }: {
   children: React.ReactNode; title?: string; onClick?: () => void; disabled?: boolean;
 }) {
-  return (
+  const btn = (
     <button onClick={disabled ? undefined : onClick} title={title} disabled={disabled}
       onMouseDown={e => e.preventDefault()} style={{
       width: 24, height: 24, borderRadius: 5, flexShrink: 0,
@@ -345,11 +345,22 @@ function ToolBtn({ children, title, onClick, disabled }: {
       cursor: disabled ? "not-allowed" : "pointer",
       color: "var(--c-low)",
       opacity: disabled ? 0.4 : 1,
+      // Disabled: hand hit-testing to the wrapper below so the tooltip works.
+      pointerEvents: disabled ? "none" : undefined,
       transition: "color 0.12s, background 0.12s",
     }}
       onMouseEnter={e => { if (disabled) return; e.currentTarget.style.color = "var(--c-high)"; e.currentTarget.style.background = "rgba(var(--fg-rgb),0.06)"; }}
       onMouseLeave={e => { if (disabled) return; e.currentTarget.style.color = "var(--c-low)"; e.currentTarget.style.background = "none"; }}
     >{children}</button>
+  );
+  // A disabled <button> takes no mouse events, so its own `title` tooltip
+  // never shows — precisely when the user most needs to be told why the
+  // control is dead. Park the title on a wrapper that still hit-tests.
+  if (!disabled) return btn;
+  return (
+    <span title={title} style={{
+      display: "inline-flex", flexShrink: 0, cursor: "not-allowed",
+    }}>{btn}</span>
   );
 }
 
@@ -368,9 +379,10 @@ function MicButton({ onTranscript }: { onTranscript: (text: string) => void }) {
   // Mic icon = record toggle (start → stop & transcribe → insert at caret);
   // the chevron still opens the device picker below.
   const dict = useVoiceDictation(onTranscript);
-  // On-device engine with no model picked → the mic can only error, so disable
-  // it (read per-render; the composer re-renders when you return from Settings).
-  const voiceReady = isVoiceReady();
+  // On-device engine with no Whisper model on disk → the mic can only ever
+  // error, so it goes inert and says why on hover. Stays live while Settings
+  // is open on top of us, so a finished download re-enables it in place.
+  const voiceReady = useVoiceReady();
 
   // Lazy-load device list from Rust (cpal) — no getUserMedia needed.
   useEffect(() => {
@@ -416,10 +428,9 @@ function MicButton({ onTranscript }: { onTranscript: (text: string) => void }) {
       gap: -2,
     }}>
       <ToolBtn
-        title={!voiceReady
-          ? "Select an on-device model in Settings → Voice to use the mic"
-          : dict.recording ? "Stop & insert" : dict.busy ? "Transcribing…" : dict.error ? dict.error : "Voice input — click to dictate"}
-        disabled={!voiceReady}
+        title={voiceReady.reason
+          ?? (dict.recording ? "Stop & insert" : dict.busy ? "Transcribing…" : dict.error ? dict.error : "Voice input — click to dictate")}
+        disabled={!voiceReady.ready}
         onClick={dict.busy ? undefined : dict.toggle}
       >
         {dict.busy
