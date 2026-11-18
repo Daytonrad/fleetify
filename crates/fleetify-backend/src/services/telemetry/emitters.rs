@@ -4,14 +4,16 @@
 //! Each `emit_*` function:
 //!   1. Truncates user-supplied strings to wire-safe lengths.
 //!   2. Generates a client-assigned UUID v4 to identify the event.
-//!   3. Persists the event via `outbox::enqueue`.
-//!   4. Pulses `event_available` so the (eventual) WS client flushes
-//!      the new event immediately instead of waiting on its poll
-//!      cadence.
+//!   3. While cloud sync is on (`cloud_gate`), persists the event's
+//!      `cloud_view` via `outbox::enqueue`.
+//!   4. Pulses `event_available` so the WS client flushes the new event
+//!      immediately instead of waiting on its poll cadence.
 //!
-//! Privacy tier: titles + paths allowed, never prompt / file content /
-//! command stdio.
+//! Privacy tier for the cloud: session titles and project folder names
+//! allowed; never activity summaries, full paths, prompt / file content
+//! or command stdio.
 
+use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -53,6 +55,118 @@ fn iso_utc(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339()
 }
 
+/// The copy of a payload the Fleetify cloud gets. Drops
+/// `activity_summary` (agent shell commands, file paths, URLs, search
+/// queries, sub-agent prompts, todo text), which the dashboard never
+/// shows. Cuts `project_path` to its last component: the full path
+/// carries the OS user name, and the dashboard shows only a short label.
+/// The home folder itself becomes `~`, since its own name is usually the
+/// OS user name. A path with no component left (empty, `null`, not a
+/// string) becomes `null`; a payload without the key stays without it.
+/// Every other key is unchanged.
+pub(crate) fn cloud_view(payload: &Value) -> Value {
+    cloud_view_for_home(payload, &fleetify_core::user_home())
+}
+
+/// `cloud_view` against a given home folder. The home folder counts as
+/// given and in its canonical form: `HOME` may be a symlink while project
+/// paths are stored canonical (`validate_project_path`).
+fn cloud_view_for_home(payload: &Value, home: &Path) -> Value {
+    let canonical = fleetify_core::canonicalize_or_keep(home);
+    let homes = [home, canonical.as_path()];
+    let rules = PathRules::current();
+    let mut view = payload.clone();
+    if let Some(fields) = view.as_object_mut() {
+        fields.remove("activity_summary");
+        let path = fields
+            .get("project_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let at_home = path
+            .as_deref()
+            .is_some_and(|p| homes.iter().any(|h| is_home_folder(p, h, rules)));
+        if let Some(project_path) = fields.get_mut("project_path") {
+            *project_path = if at_home {
+                Value::from("~")
+            } else {
+                project_folder(path.as_deref()).map_or(Value::Null, Value::from)
+            };
+        }
+        if at_home {
+            // An untitled session is named after its folder, so a session
+            // in the home folder would carry the OS user name as its title.
+            let names: Vec<String> = homes
+                .iter()
+                .map(|h| h.to_string_lossy().into_owned())
+                .chain(path)
+                .filter_map(|p| project_folder(Some(&p)).map(str::to_owned))
+                .collect();
+            if let Some(title) = fields.get_mut("session_title") {
+                if title
+                    .as_str()
+                    .is_some_and(|t| names.iter().any(|n| rules.same(t, n)))
+                {
+                    *title = Value::from("~");
+                }
+            }
+        }
+    }
+    view
+}
+
+/// How this OS's file system compares paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathRules {
+    /// Linux: case and separators count.
+    Exact,
+    /// macOS (APFS, HFS+ by default): case doesn't count; `\` is a
+    /// character, not a separator.
+    IgnoreCase,
+    /// Windows: case doesn't count and `/` matches `\`.
+    Windows,
+}
+
+impl PathRules {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::IgnoreCase
+        } else {
+            Self::Exact
+        }
+    }
+
+    fn normalise(self, path: &str) -> String {
+        match self {
+            Self::Exact => path.to_string(),
+            Self::IgnoreCase => path.to_lowercase(),
+            Self::Windows => path.replace('\\', "/").to_lowercase(),
+        }
+    }
+
+    fn same(self, a: &str, b: &str) -> bool {
+        self.normalise(a) == self.normalise(b)
+    }
+}
+
+/// Whether `path` is the home folder itself, trailing separators ignored.
+fn is_home_folder(path: &str, home: &Path, rules: PathRules) -> bool {
+    let trim = |p: &str| p.trim_end_matches(['/', '\\']).to_string();
+    let path = trim(path);
+    !path.is_empty() && rules.same(&path, &trim(&home.to_string_lossy()))
+}
+
+/// Last component of a path, split on `/` and `\` alike, trailing
+/// separators ignored. `None` when nothing is left.
+fn project_folder(path: Option<&str>) -> Option<&str> {
+    path?
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|folder| !folder.is_empty())
+}
+
 async fn enqueue_payload(payload: Value) -> Result<()> {
     // No-auth dev mode: never enqueue. The WS client and heartbeat loop
     // are also skipped at startup, so without this guard the outbox
@@ -60,11 +174,29 @@ async fn enqueue_payload(payload: Value) -> Result<()> {
     if crate::auth::is_no_auth() {
         return Ok(());
     }
-    let event_id = uuid::Uuid::new_v4().to_string();
-    outbox::enqueue(&event_id, &payload).await?;
-    // Fan out to the PostHog sink. No-op when the runtime gate is
-    // closed or POSTHOG_API_KEY was unset at build time.
+    let cloud = if super::cloud_enabled() {
+        enqueue_for_cloud(&payload).await
+    } else {
+        Ok(())
+    };
+    // Fan out to the PostHog sink whatever the cloud gate says: it has its
+    // own consent gate, and its mapper hashes the full project path and
+    // drops summaries, so it gets the original payload. No-op when its
+    // gate is closed or POSTHOG_API_KEY is unset.
     super::posthog::enqueue_if_enabled(&payload).await;
+    cloud
+}
+
+async fn enqueue_for_cloud(payload: &Value) -> Result<()> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    outbox::enqueue(&event_id, &cloud_view(payload)).await?;
+    if !super::cloud_enabled() {
+        // Sync was turned off while this row was being written, and the
+        // purge may have run before it landed. Drop it so nothing stays
+        // queued.
+        outbox::mark_acked(&event_id).await?;
+        return Ok(());
+    }
     tracing::info!(
         target: "fleetify.telemetry.emit",
         "telemetry: enqueued kind={} id={} session={}",
@@ -561,19 +693,230 @@ mod tests {
 }
 
 #[cfg(test)]
+mod cloud_sync_tests {
+    use super::*;
+    use crate::services::telemetry::cloud_gate::test_support::GateGuard;
+    use crate::services::telemetry::set_cloud_enabled;
+
+    async fn pending_for(session_id: &str) -> Vec<Value> {
+        outbox::peek_pending(1_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .filter(|p| p["local_session_id"] == session_id)
+            .collect()
+    }
+
+    #[test]
+    fn cloud_view_drops_activity_summary_and_keeps_only_the_project_folder() {
+        let activity = json!({
+            "kind": "activity",
+            "activity_kind": "bash",
+            "activity_summary": "export TOKEN=x",
+        });
+        let v = cloud_view(&activity);
+        assert!(v.get("activity_summary").is_none(), "summary sent: {v}");
+        assert_eq!(v["activity_kind"], "bash");
+        assert_eq!(v["kind"], "activity");
+
+        let folder =
+            |path: Value| cloud_view(&json!({ "project_path": path }))["project_path"].clone();
+        assert_eq!(folder(json!("/home/u/work/fleetify")), json!("fleetify"));
+        assert_eq!(folder(json!("/home/u/work/fleetify/")), json!("fleetify"));
+        assert_eq!(folder(json!("C:\\Users\\u\\proj")), json!("proj"));
+        assert_eq!(folder(json!("")), Value::Null);
+        assert_eq!(folder(Value::Null), Value::Null);
+
+        // The home folder itself goes out as `~`: its name is usually the
+        // OS user name, and the Fleet hub's own session runs there.
+        let label = |path: Value| {
+            cloud_view_for_home(&json!({ "project_path": path }), Path::new("/home/u"))
+                ["project_path"]
+                .clone()
+        };
+        assert_eq!(label(json!("/home/u")), json!("~"));
+        assert_eq!(label(json!("/home/u/")), json!("~"));
+        // Folders under home keep their names, even one named like the user.
+        assert_eq!(label(json!("/home/u/work/fleetify")), json!("fleetify"));
+        assert_eq!(label(json!("/home/u/u")), json!("u"));
+        // Only the home folder itself: not a sibling that starts the same.
+        assert_eq!(label(json!("/home/user")), json!("user"));
+        assert_eq!(label(json!("")), Value::Null);
+        // Case and separator style count on Linux. Windows ignores both;
+        // macOS (APFS, HFS+) ignores case but keeps `\` as a character.
+        let exact = PathRules::Exact;
+        let mac = PathRules::IgnoreCase;
+        let win = PathRules::Windows;
+        assert!(!is_home_folder("/home/U", Path::new("/home/u"), exact));
+        assert!(is_home_folder("/Users/U", Path::new("/Users/u"), mac));
+        assert!(!is_home_folder("/Users/u/x", Path::new("/Users/u\\x"), mac));
+        assert!(is_home_folder(
+            "C:\\Users\\U\\",
+            Path::new("c:\\users\\u"),
+            win
+        ));
+        assert!(is_home_folder("C:/Users/U", Path::new("C:\\Users\\U"), win));
+        assert!(!is_home_folder(
+            "C:\\Users\\U\\proj",
+            Path::new("C:\\Users\\U"),
+            win
+        ));
+        assert!(!is_home_folder("", Path::new(""), exact));
+        // `cloud_view` compares against the real home folder.
+        let home = fleetify_core::user_home();
+        assert_eq!(folder(json!(home.to_string_lossy())), json!("~"));
+
+        let start = json!({
+            "kind": "session_start",
+            "local_session_id": "s1",
+            "tool": "claude-code",
+            "model": "claude-sonnet-4-6",
+            "status": "running",
+            "session_title": "Fix the flaky build",
+            "project_path": "/home/u/work/fleetify",
+            "occurred_at": "2026-11-17T10:00:00+00:00",
+        });
+        let v = cloud_view(&start);
+        for key in [
+            "kind",
+            "local_session_id",
+            "tool",
+            "model",
+            "status",
+            "session_title",
+            "occurred_at",
+        ] {
+            assert_eq!(v[key], start[key], "{key} changed");
+        }
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            start.as_object().unwrap().len(),
+            "keys added or lost: {v}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_home_folder_is_sent_as_tilde() {
+        // HOME may be a symlink while project paths are stored canonical
+        // (`validate_project_path`), so the canonical home counts too.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-home");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("home-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let stored = fleetify_core::canonicalize_or_keep(&real);
+
+        let view = cloud_view_for_home(&json!({ "project_path": stored.to_string_lossy() }), &link);
+        assert_eq!(view["project_path"], json!("~"));
+        // A folder under the real home keeps its name.
+        let under = stored.join("work");
+        let view = cloud_view_for_home(&json!({ "project_path": under.to_string_lossy() }), &link);
+        assert_eq!(view["project_path"], json!("work"));
+    }
+
+    #[test]
+    fn a_session_named_after_the_home_folder_is_sent_as_tilde() {
+        // The composer names an untitled session after its folder, so a
+        // session in the home folder would carry the OS user name.
+        let home = Path::new("/home/u");
+        let view = |path: &str, title: &str| {
+            cloud_view_for_home(
+                &json!({ "project_path": path, "session_title": title }),
+                home,
+            )
+        };
+        let at_home = view("/home/u", "u");
+        assert_eq!(at_home["project_path"], json!("~"));
+        assert_eq!(at_home["session_title"], json!("~"));
+        // Other titles of a home session are kept.
+        assert_eq!(
+            view("/home/u", "Staff Agent")["session_title"],
+            json!("Staff Agent")
+        );
+        assert_eq!(
+            view("/home/u", "u notes")["session_title"],
+            json!("u notes")
+        );
+        // A folder named like the user, but not home, keeps both.
+        let elsewhere = view("/home/u/u", "u");
+        assert_eq!(elsewhere["project_path"], json!("u"));
+        assert_eq!(elsewhere["session_title"], json!("u"));
+        // No title, no project: nothing is added.
+        let bare = cloud_view_for_home(&json!({ "project_path": "/home/u" }), home);
+        assert!(bare.get("session_title").is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_skips_the_cloud_outbox_while_the_gate_is_closed() {
+        let _g = outbox::tests::TEST_LOCK.lock().await;
+        outbox::tests::ensure_inited().await;
+        let _gate = GateGuard::new();
+
+        set_cloud_enabled(false).await;
+        let before = outbox::count().await.unwrap();
+        emit_status_change("s-gate-closed", "running", Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            outbox::count().await.unwrap(),
+            before,
+            "a closed gate must not queue cloud events"
+        );
+
+        set_cloud_enabled(true).await;
+        emit_status_change("s-gate-open", "running", Utc::now())
+            .await
+            .unwrap();
+        // Count this test's row rather than the whole table: other modules'
+        // tests may emit while the gate is open here.
+        assert_eq!(
+            pending_for("s-gate-open").await.len(),
+            1,
+            "an open gate queues the event once"
+        );
+        assert!(outbox::count().await.unwrap() > before);
+    }
+
+    #[tokio::test]
+    async fn cloud_outbox_rows_never_contain_activity_summaries() {
+        let _g = outbox::tests::TEST_LOCK.lock().await;
+        outbox::tests::ensure_inited().await;
+        let _gate = GateGuard::new();
+
+        set_cloud_enabled(true).await;
+        emit_activity("s-summary", "command", Some("rm -rf secret"), Utc::now())
+            .await
+            .unwrap();
+
+        let rows = pending_for("s-summary").await;
+        assert_eq!(rows.len(), 1, "the activity event was queued");
+        assert_eq!(rows[0]["activity_kind"], "command");
+        assert!(
+            rows[0].get("activity_summary").is_none(),
+            "summary queued for the cloud: {}",
+            rows[0]
+        );
+    }
+}
+
+#[cfg(test)]
 mod routing_emitter_tests {
     use super::*;
+    use crate::services::telemetry::cloud_gate::test_support::GateGuard;
+    use crate::services::telemetry::set_cloud_enabled;
     use chrono::TimeZone;
-    use tokio::sync::Mutex;
 
     fn ts() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap()
     }
 
-    // Same rationale as `outbox::tests::TEST_LOCK` — these tests share a
-    // process-wide POOL OnceLock; serialise them through a tokio Mutex so
-    // a `reset()` in one test doesn't race another's assertions.
-    static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    // These tests share the process-wide POOL OnceLock and the cloud-sync
+    // gate with the outbox and gate tests, so they take the same lock
+    // (`outbox::tests::TEST_LOCK`): a `reset()` or a gate flip in one test
+    // must not race another's assertions.
+    use super::outbox::tests::TEST_LOCK;
 
     async fn ensure_outbox_inited() {
         let dir = tempfile::tempdir().unwrap();
@@ -743,6 +1086,9 @@ mod routing_emitter_tests {
     async fn cost_with_decision_id_does_not_panic() {
         let _g = TEST_LOCK.lock().await;
         ensure_outbox_inited().await;
+        // Open the cloud gate so the event still reaches the outbox write.
+        let _gate = GateGuard::new();
+        set_cloud_enabled(true).await;
         let r = emit_cost(
             "s1",
             "claude-sonnet-4-6",
@@ -762,6 +1108,9 @@ mod routing_emitter_tests {
     async fn cost_without_decision_id_does_not_panic() {
         let _g = TEST_LOCK.lock().await;
         ensure_outbox_inited().await;
+        // Open the cloud gate so the event still reaches the outbox write.
+        let _gate = GateGuard::new();
+        set_cloud_enabled(true).await;
         let r = emit_cost(
             "s1",
             "claude-sonnet-4-6",

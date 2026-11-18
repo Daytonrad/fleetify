@@ -1,11 +1,15 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { PermissionRequest } from "@/stores/chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { formatShortcut } from "@/lib/keyboard-shortcuts";
+import { getPlatform } from "@/lib/utils";
+import { isOnScreen, cardShortcut, cardShortcutOwnedElsewhere } from "@/hooks/use-escape-to-stop";
+import { paneOwnsInput } from "./pane-session-context";
 
 interface Props {
   request: PermissionRequest;
-  sessionId: string;
+  /** The split-view pane this card is in; undefined in the single view. */
+  paneIdx?: number;
   onAllow: (id: string, toolName: string) => void;
   onAllowAlways: (id: string, toolName: string) => void;
   onDeny: (id: string, toolName: string) => void;
@@ -55,7 +59,7 @@ const VARIANT_META: Record<CardVariant, { label: string; accentColor: string }> 
 
 export function PermissionDialog({
   request,
-  sessionId,
+  paneIdx,
   onAllow,
   onAllowAlways,
   onDeny,
@@ -68,31 +72,47 @@ export function PermissionDialog({
 
   /* Keyboard shortcuts.
    *
-   * Active-session guard: a window-level keydown fires regardless of
-   * which agent the user is currently viewing. If a permission dialog
-   * is up on agent A and the user is now focused on agent B, hitting
-   * Esc to close some other popover used to silently deny A's
-   * permission request because this listener was still bound. Now we
-   * read the active session at handler time and bail if it's not us. */
+   * Pane guard: a window-level keydown fires whichever pane the user is
+   * in. A split view shows every pane's card at once, so only the pane
+   * that owns input may answer: the focused pane, the same rule as
+   * Escape-to-stop (`paneOwnsInput`). The single view always owns it. The
+   * focused pane is read at handler time, so it is never stale.
+   *
+   * Parked guard: App.tsx keeps the shell mounted under `display: none`
+   * while Settings or Library is open, so this listener outlives the
+   * card's visibility. The Escape that closes either of them must not
+   * also deny the request hidden underneath.
+   *
+   * Elsewhere guard (`cardShortcutOwnedElsewhere`): a key that belongs to
+   * something else answers nothing. That is the Escape a popover or modal
+   * claimed to close itself, a key typed in a field outside this chat,
+   * any key while a modal is open, and a Mod+Enter typed in any field or
+   * already acted on by another handler. The Escape that stops the stream
+   * is not a claim, so it still skips the question.
+   *
+   * Mod is the key the labels show (`cardShortcut`): ⌘ on macOS, Ctrl on
+   * Windows and Linux. */
+  const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    const platform = getPlatform();
     const handler = (e: KeyboardEvent) => {
-      // Lazy import to avoid a circular module; lookup is cheap.
-      const active = useAppStore.getState().activeSessionId;
-      if (active && active !== sessionId) return;
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onDeny(request.id, request.tool_name);
-      } else if (e.key === "Enter" && e.metaKey && e.shiftKey && !isQuestion) {
-        e.preventDefault();
-        onAllowAlways(request.id, request.tool_name);
-      } else if (e.key === "Enter" && e.metaKey) {
-        e.preventDefault();
-        onAllow(request.id, request.tool_name);
-      }
+      // Only Esc and Mod+Enter / Mod+Shift+Enter act. Return on any other
+      // key first, so ordinary typing never pays for isOnScreen's
+      // computed-style walk.
+      const shortcut = cardShortcut(e, platform);
+      if (!shortcut) return;
+      if (cardShortcutOwnedElsewhere(e, shortcut, rootRef.current)) return;
+      if (!paneOwnsInput(paneIdx, useAppStore.getState().focusedPaneIdx)) return;
+      if (!isOnScreen(rootRef.current)) return;
+      e.preventDefault();
+      if (shortcut === "deny") onDeny(request.id, request.tool_name);
+      // A question can't be always-allowed: Mod+Shift+Enter answers it once.
+      else if (shortcut === "allowAlways" && !isQuestion) onAllowAlways(request.id, request.tool_name);
+      else onAllow(request.id, request.tool_name);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [request.id, request.tool_name, sessionId, onAllow, onAllowAlways, onDeny, isQuestion]);
+  }, [request.id, request.tool_name, paneIdx, onAllow, onAllowAlways, onDeny, isQuestion]);
 
   return (
     <>
@@ -110,7 +130,7 @@ export function PermissionDialog({
           before the BranchStrip so the two cards read as a stacked
           pair, not as one element. Theme-adaptive (#161616 in dark,
           #ffffff in light) so it works for both. */}
-      <div style={{
+      <div ref={rootRef} style={{
         animation: "permCardIn 0.18s cubic-bezier(0.22, 1, 0.36, 1) both",
       }}>
         <div style={{

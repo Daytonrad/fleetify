@@ -4,8 +4,12 @@
 
 mod shell;
 
+// The app's commands, by name: its ACL manifest. build.rs compiles this file
+// in for tauri-build; the crate itself only needs it for tests.
+#[cfg(test)]
+mod app_commands;
+
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use tauri::webview::WebviewWindowBuilder;
 #[cfg(target_os = "macos")]
@@ -17,46 +21,16 @@ use tauri::{Manager, WebviewUrl};
 /// Boot shim reconstructing `window.electronAPI` / `window.fleetify`.
 const PRELOAD: &str = include_str!("preload.js");
 
-/// URL the main webview is pointed at. Debug builds load the Vite dev
-/// server (`VITE_PORT`, default 3000); release builds load the
-/// embedded backend serving the bundled dist (`FLEETIFY_BACKEND_PORT`,
-/// default 8765). Honouring the env vars is what lets the
-/// `dev:tauri:wt` script (and the parallel-worktree workflow it
-/// enables) run two app instances on different ports side-by-side.
-fn webview_url() -> String {
-    if cfg!(debug_assertions) {
-        let port = std::env::var("VITE_PORT").unwrap_or_else(|_| "3000".into());
-        format!("http://localhost:{port}")
-    } else {
-        let port = std::env::var("FLEETIFY_BACKEND_PORT").unwrap_or_else(|_| "8765".into());
-        format!("http://127.0.0.1:{port}")
-    }
-}
-
-/// Parse `FLEETIFY_BACKEND_PORT` with a hard-coded 8765 fallback. The
-/// embedded backend binds this port; the webview URL in release mode
-/// (and the Vite dev proxy in debug mode) target the same port.
-fn backend_port() -> u16 {
-    match std::env::var("FLEETIFY_BACKEND_PORT") {
+/// Parse `VITE_PORT` with a 3000 fallback, as `vite.config.ts` does. Debug
+/// builds load the app from the Vite dev server on this port (see
+/// `shell::startup_window::app_origin`).
+fn vite_port() -> u16 {
+    match std::env::var("VITE_PORT") {
         Ok(s) => s.parse().unwrap_or_else(|_| {
-            // Surface the misconfiguration instead of silently binding 8765 —
-            // a typo'd port otherwise looks like "the backend won't connect".
-            tracing::warn!(value = %s, "FLEETIFY_BACKEND_PORT is not a valid port; falling back to 8765");
-            8765
+            tracing::warn!(value = %s, "VITE_PORT is not a valid port; falling back to 3000");
+            3000
         }),
-        Err(_) => 8765,
-    }
-}
-
-fn static_dir() -> Option<PathBuf> {
-    if cfg!(debug_assertions) {
-        None
-    } else {
-        let beside_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("dist")))
-            .filter(|p| p.exists());
-        Some(beside_exe.unwrap_or_else(|| PathBuf::from("dist")))
+        Err(_) => 3000,
     }
 }
 
@@ -129,8 +103,10 @@ pub fn run() {
             shell::ipc::config_set,
             shell::ipc::telemetry_get_config,
             shell::ipc::telemetry_set_posthog_enabled,
+            shell::ipc::telemetry_set_cloud_enabled,
             shell::ipc::shell_open_external,
             shell::ipc::shell_show_item_in_folder,
+            shell::ipc::shell_open_path,
             shell::ipc::detect_editors,
             shell::ipc::open_in_editor,
             shell::ipc::clipboard_write,
@@ -258,6 +234,12 @@ pub fn run() {
         .manage(shell::voice::DownloadCancelState(std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )))
+        // The page the main window starts on, until the app answers (see
+        // shell::startup_window).
+        .register_uri_scheme_protocol(
+            shell::startup_window::PLACEHOLDER_SCHEME,
+            |ctx, _request| shell::startup_window::placeholder_response(ctx.webview_label()),
+        )
         .setup(|app| {
             // X errors are FATAL in GDK by default: one async BadWindow (e.g.
             // a GDK XTranslateCoordinates racing a webview teardown, or the
@@ -299,6 +281,19 @@ pub fn run() {
             // Auth module emits `fleet:auth-event` via this handle.
             shell::auth::set_app_handle(app.handle().clone());
 
+            // Decide Fleetify cloud sync for this launch before anything
+            // else reads or writes fleet.config.json: ahead of the key
+            // migration below, and of the renderer (no command runs until
+            // setup returns). A file that is there but can't be read or
+            // parsed keeps sync off and gets an explicit opt-out saved, so
+            // no later save can drop the user's earlier choice. The early
+            // open and the final restore below both follow this decision.
+            let cloud_open_at_launch = app
+                .path()
+                .app_data_dir()
+                .map(|dir| shell::config::startup_cloud_decision(&dir))
+                .unwrap_or(false);
+
             // One-shot lift of any plaintext `cfg.apiKeys` entries into
             // the OS keychain. Idempotent — empty / already-migrated
             // configs are a no-op. Runs on the async runtime so a slow
@@ -309,20 +304,87 @@ pub fn run() {
                 shell::migration::migrate_api_keys_to_keychain(&app_for_migration).await;
             });
 
+            // The ports, parsed once: the main window loads the app from
+            // one of them (shell::startup_window::app_origin), and the
+            // embedded backend binds `backend` below. FLEETIFY_BACKEND_PORT
+            // is read here only; everything else gets that port from
+            // shell::backend_ready.
+            let release = !cfg!(debug_assertions);
+            let backend = shell::backend_ready::port_from_env(
+                std::env::var("FLEETIFY_BACKEND_PORT").ok().as_deref(),
+            );
+            let vite = vite_port();
+
+            // The backend's start: the main window loads the app only after
+            // its bind and says so when it can't start (see
+            // shell::startup_window::load_app_when_ready), and the shell
+            // sends it keys or the internal secret only once it is bound
+            // (shell::backend_ready::bound_port).
+            let (backend_start_tx, backend_start_rx) =
+                tokio::sync::watch::channel(shell::backend_ready::BackendStart::Pending);
+            shell::backend_ready::track(backend, backend_start_rx.clone());
+
+            // IPC from the app's origin. capabilities/default.json covers
+            // only local origins (devUrl in dev mode). The origin the window
+            // loads the app from gets the same permissions here, for that
+            // origin alone and the main webview: always in release (the
+            // embedded backend on http://127.0.0.1:<port>), and in debug only
+            // when Vite isn't the local devUrl. No other remote origin can
+            // call anything. Added before the window is built. A release
+            // build has no other grant, so a failed one stops the start: the
+            // backend task below reports it instead of starting the backend,
+            // and the window shows the error dialog, then the app quits.
+            let local_app_url =
+                shell::startup_window::local_app_url(app.config(), tauri::is_dev());
+            let grant = match shell::startup_window::runtime_remote_origin(
+                release,
+                backend,
+                vite,
+                local_app_url.as_ref(),
+            ) {
+                Some(origin) => {
+                    let grant = shell::startup_window::grant_app_origin(app, &origin);
+                    match &grant {
+                        Ok(()) => tracing::info!(%origin, "IPC allowed from the app origin"),
+                        Err(e) => tracing::error!(
+                            %origin,
+                            "allowing IPC from the app origin failed, so the app can't call its own commands: {e}"
+                        ),
+                    }
+                    grant
+                }
+                None => Ok(()),
+            };
+
             // No splash — by explicit user preference. The main
-            // window is built `.visible(false)` and stays hidden until
-            // both the embedded backend AND the webview's target URL
-            // (Vite in debug, the backend in release) are reachable.
-            // Direct WebviewWindow handle clone (no get_webview_window
-            // lookup) avoids the AppHandle race the earlier version
-            // hit on Windows. Trade-off: from t=0 to URL-ready (~3-7s
-            // depending on Vite cold-start) the user sees nothing on
-            // screen. That's the price of "no visible loading state".
+            // window is built `.visible(false)` on a local placeholder
+            // page and stays hidden until the app's URL (Vite in debug,
+            // the embedded backend in release) answers and the app page
+            // has loaded in it. It never loads that URL before then: the
+            // engine doesn't retry a first navigation that failed, so a
+            // slow backend bind used to leave its error page on screen.
+            // A start slower than 15s shows the window with the
+            // placeholder ("Starting Fleetify…") until the app loads.
+            // See shell::startup_window. Direct WebviewWindow handle
+            // clone (no get_webview_window lookup) avoids the AppHandle
+            // race the earlier version hit on Windows.
+            let app_url: tauri::Url = shell::startup_window::app_origin(release, backend, vite)
+                .parse()
+                .expect("valid webview url");
+            let app_page_loaded = std::sync::Arc::new(tokio::sync::Notify::new());
             let builder = WebviewWindowBuilder::new(
                 app,
-                "main",
-                WebviewUrl::External(webview_url().parse().expect("valid webview url")),
+                shell::startup_window::MAIN_WINDOW,
+                WebviewUrl::CustomProtocol(
+                    shell::startup_window::PLACEHOLDER_URL
+                        .parse()
+                        .expect("valid placeholder url"),
+                ),
             )
+            .on_page_load(shell::startup_window::signal_app_page_loaded(
+                app_url.clone(),
+                app_page_loaded.clone(),
+            ))
             .title("Fleetify")
             // Cold-start at the ONBOARDING size (760×740) rather than
             // the MAIN size (1500×960). Reveal-when-ready paints the
@@ -387,10 +449,41 @@ pub fn run() {
             // Weave, LiteLLM) already registered when the user had them
             // connected. Fresh installs hand over an empty setup and
             // the backend boots with builtin + DirectGateway only.
-            let addr: SocketAddr = format!("127.0.0.1:{}", backend_port()).parse().unwrap();
-            let sd = static_dir();
+            let addr: SocketAddr = format!("127.0.0.1:{backend}").parse().unwrap();
+            // The UI files it serves: in release, `dist` in the install's
+            // resource folder and nowhere else (shell::ui_files); in debug
+            // none, as Vite serves the UI. With no UI files to serve, the
+            // backend never starts: its task reports that as a failed
+            // start, so the window shows the error dialog and the app quits
+            // (shell::startup_window).
+            let ui_files =
+                shell::ui_files::served_ui_dir(release, || app.path().resource_dir());
             let app_data_dir = app.path().app_data_dir().ok();
             tauri::async_runtime::spawn(async move {
+                if let Err(error) = grant {
+                    tracing::error!(
+                        "the interface has no permissions, so the backend won't start: {error}"
+                    );
+                    let _ = backend_start_tx.send(shell::backend_ready::BackendStart::Failed(
+                        shell::backend_ready::StartFailure::Permissions(error),
+                    ));
+                    return;
+                }
+                let sd = match ui_files {
+                    Ok(sd) => sd,
+                    Err(missing) => {
+                        tracing::error!(
+                            "the UI files are missing, so the backend won't start: {missing}"
+                        );
+                        let _ = backend_start_tx.send(shell::backend_ready::BackendStart::Failed(
+                            shell::backend_ready::StartFailure::UiFilesMissing(missing),
+                        ));
+                        return;
+                    }
+                };
+                if let Some(dir) = &sd {
+                    tracing::info!("serving the UI files from {}", dir.display());
+                }
                 let routing_setup = match app_data_dir {
                     Some(dir) => {
                         let uid = shell::auth::get_user_id().await;
@@ -414,9 +507,13 @@ pub fn run() {
                             backend_bind_ms = boot_start.elapsed().as_millis() as u64,
                             "embedded backend up on {addr}"
                         );
+                        let _ = backend_start_tx.send(shell::backend_ready::BackendStart::Bound);
                     }
                     Err(e) => {
-                        tracing::error!("backend failed to start: {e}");
+                        tracing::error!("backend failed to start: {e:#}");
+                        let _ = backend_start_tx.send(shell::backend_ready::BackendStart::Failed(
+                            shell::backend_ready::StartFailure::Backend(format!("{e:#}")),
+                        ));
                     }
                 }
             });
@@ -442,41 +539,80 @@ pub fn run() {
             // the keychain and prime HttpHealthCache so the first chat
             // turn doesn't hit "No API key" and Settings → Models
             // opens with final pills instead of the "Testing…" flash.
-            // Waits for the embedded backend to bind before hitting it
-            // (200ms × 20 = 4s upper bound covers a cold Rust startup).
+            // Runs only once the embedded backend has reported its bind
+            // and answers its health route; otherwise it is skipped.
             let handle = app.handle().clone();
+            let warm_up_start = backend_start_rx.clone();
             tauri::async_runtime::spawn(async move {
-                // Wait for the embedded backend to bind its port before
-                // we try to reach it. 200ms × 20 = 4s upper bound covers
-                // a cold Rust startup on a slow disk.
-                let port = std::env::var("FLEETIFY_BACKEND_PORT").unwrap_or_else(|_| "8765".into());
-                let health_url = format!("http://127.0.0.1:{port}/health");
-                for _ in 0..20 {
-                    if let Ok(r) = reqwest::get(&health_url).await {
-                        if r.status().is_success() {
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                crate::shell::providers_setup::warm_providers_at_boot(&handle).await;
-                // Hydrate the backend clone service with the linked GitHub
-                // token so private-repo clones authenticate from the first try.
-                crate::shell::github_link::push_clone_token().await;
-
-                // Restore the persisted PostHog opt-in. The backend's
-                // posthog::init already ran inside serve(), so the
-                // outbox + worker are wired; we just need to flip the
-                // runtime gate to match what the user previously
-                // consented to. Fresh installs land on default-off
-                // because telemetry_from returns Default on missing.
+                // Both telemetry gates start closed in the backend. Open the
+                // ones that are on right away rather than after the warm-up
+                // below: `telemetry_get_config` reports the live gates, and
+                // the renderer reads it as soon as it loads (it decides then
+                // whether to start posthog-js). It also keeps the backend's
+                // first heartbeat and early session events. The PostHog gate
+                // is only a flag, so it can open before serve() has set up
+                // the PostHog sink. The cloud gate follows the launch
+                // decision made at the top of setup; closing it waits for
+                // the restore at the end of this task. Rows older builds
+                // queued depend on neither: the outbox drops them itself
+                // when it opens, before anything can read them.
                 if let Ok(dir) = handle.path().app_data_dir() {
                     let cfg = crate::shell::config::load_config_from(&dir);
-                    let telem = crate::shell::config::telemetry_from(&cfg);
-                    if telem.posthog_enabled {
+                    if crate::shell::config::telemetry_from(&cfg).posthog_enabled {
                         fleetify_backend::services::telemetry::posthog::set_enabled(true);
                     }
                 }
+                if cloud_open_at_launch {
+                    fleetify_backend::services::telemetry::set_cloud_enabled(true).await;
+                }
+
+                // The warm-up sends provider keys and the internal secret, so
+                // it talks only to the app's own backend: it waits for the
+                // bind, then for the health route (200ms × 20 = 4s covers a
+                // cold Rust startup on a slow disk). A backend that fails,
+                // never reports, or doesn't answer gets nothing: before the
+                // bind, whatever answers on the port is something else. The
+                // next reload trigger (a Settings change) sends the keys.
+                if crate::shell::backend_ready::wait_until_bound(warm_up_start).await {
+                    let ready = crate::shell::backend_ready::wait_for_backend(
+                        &crate::shell::backend_ready::health_url(&backend.to_string()),
+                        20,
+                        std::time::Duration::from_millis(200),
+                    )
+                    .await;
+                    if ready {
+                        crate::shell::providers_setup::warm_providers_at_boot(&handle).await;
+                        // Hydrate the backend clone service with the linked
+                        // GitHub token so private-repo clones authenticate
+                        // from the first try.
+                        crate::shell::github_link::push_clone_token().await;
+                    } else {
+                        tracing::warn!(
+                            "backend health check timed out; skipping the provider warm-up"
+                        );
+                    }
+                } else {
+                    tracing::warn!("the embedded backend didn't start; skipping the provider warm-up");
+                }
+
+                // Finish the Fleetify cloud sync restore: close the gate if
+                // the launch decision kept sync off, or if the saved choice
+                // is off now (a file that can't be read or parsed counts as
+                // off). Closing also purges what is still queued, if the
+                // backend has opened its outbox by now. Nothing orders this
+                // after that, so rows older builds queued are dropped by the
+                // outbox itself. It never opens the gate, and it does
+                // nothing if Settings changed it since launch: reapplying
+                // the saved choice here would undo a switch whose save
+                // failed. (The PostHog gate was restored at the top of this
+                // task, for the same reason.)
+                let saved_on = cloud_open_at_launch
+                    && handle
+                        .path()
+                        .app_data_dir()
+                        .map(|dir| crate::shell::config::saved_cloud_choice(&dir))
+                        .unwrap_or(false);
+                crate::shell::ipc::finish_cloud_sync_restore(saved_on).await;
             });
 
             // Prime the integrations cache in parallel — only needs the
@@ -488,39 +624,23 @@ pub fn run() {
                 crate::shell::integrations_cache::prime_gh_cli().await;
             });
 
-            // Reveal-when-ready: poll the webview URL until it
-            // answers HTTP, then show + focus. Any non-connection-
-            // error response counts as "up" (even 404 → renderer can
-            // surface the failure). 15s wall-clock cap so a stuck
-            // dev server doesn't leave the user with a permanently
-            // invisible app. 120ms grace before show() lets the
-            // first React frame paint so we don't flash white.
-            let webview_url_owned: String = webview_url();
-            let main_for_reveal = main_window.clone();
-            tauri::async_runtime::spawn(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_millis(500))
-                    .build()
-                    .expect("reqwest client");
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                while std::time::Instant::now() < deadline {
-                    if client.get(&webview_url_owned).send().await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                if let Err(e) = main_for_reveal.show() {
-                    tracing::warn!("show main window failed: {e}");
-                } else {
-                    tracing::info!(
-                        target: "fleetify::startup",
-                        cold_start_ms = boot_start.elapsed().as_millis() as u64,
-                        "main window revealed"
-                    );
-                }
-                let _ = main_for_reveal.set_focus();
-            });
+            // Reveal-when-ready: once the backend reports its bind, poll the
+            // webview URL until it answers HTTP (any response counts, even a
+            // 404 the renderer can surface), then load the app in the window
+            // and show + focus it once the app page has loaded, so it
+            // doesn't flash white. Past 15s the window shows the placeholder
+            // and the wait goes on with no cap. A backend that can't start,
+            // has no UI files to serve, or wasn't started because the
+            // interface got no permissions, ends it: an error dialog, then
+            // the app quits.
+            tauri::async_runtime::spawn(shell::startup_window::load_app_when_ready(
+                main_window,
+                app_url,
+                app_page_loaded,
+                backend_start_rx,
+                backend,
+                boot_start,
+            ));
 
             // Loopback bearer bridge :8770 (telemetry token source / parity).
             // FLEETIFY_NOAUTH=1 has no consumer to feed and no token to
@@ -533,6 +653,7 @@ pub fn run() {
                 // Telemetry WS client → fleetify.dev. Bearer pulled from
                 // shell::auth.get_access_token() lazily per attempt so a
                 // mid-flow refresh is picked up at the next reconnect.
+                // Idles (no bearer, no socket) while cloud sync is off.
                 tauri::async_runtime::spawn(async {
                     let source: fleetify_backend::services::telemetry::BearerSource =
                         std::sync::Arc::new(|| {

@@ -61,12 +61,10 @@ fn noauth_tokens() -> Tokens {
         scope: DEFAULT_SCOPES.into(),
     }
 }
+/// Identity-provider origin; production in release builds. Shared with the
+/// embedded backend's token validation via `fleetify_core::endpoints`.
 pub fn issuer() -> String {
-    if is_prod() {
-        "https://fleetify.dev".into()
-    } else {
-        env_or("FLEETIFY_ISSUER", "http://localhost:3001")
-    }
+    fleetify_core::endpoints::issuer_origin()
 }
 pub fn auth_base() -> String {
     format!("{}/api/auth", issuer())
@@ -78,12 +76,10 @@ fn dashboard_url() -> String {
         env_or("FLEETIFY_DASHBOARD_URL", "http://localhost:5174")
     }
 }
+/// RFC 8707 resource indicator: the audience the embedded backend expects
+/// (`fleetify_core::endpoints`); production in release builds.
 fn resource() -> String {
-    if is_prod() {
-        "https://fleetify.dev/api".into()
-    } else {
-        env_or("FLEETIFY_RESOURCE", "http://127.0.0.1:8765")
-    }
+    fleetify_core::endpoints::api_resource()
 }
 
 #[derive(Clone, Serialize)]
@@ -163,9 +159,25 @@ fn keyring_entry() -> keyring::Result<keyring::Entry> {
 fn keyring_get() -> Option<String> {
     keyring_entry().ok().and_then(|e| e.get_password().ok())
 }
-fn keyring_set(v: &str) {
-    if let Ok(e) = keyring_entry() {
-        let _ = e.set_password(v);
+fn keyring_set(v: &str) -> keyring::Result<()> {
+    keyring_entry()?.set_password(v)
+}
+
+/// Auth event for a refresh token that could not be saved; the renderer
+/// shows a warning banner on it.
+fn keychain_failure_event() -> serde_json::Value {
+    serde_json::json!({"kind": "keychain-unavailable"})
+}
+
+/// Saves the refresh token so the next launch starts signed in. When the
+/// keychain refuses it (Linux without an unlocked Secret Service, a
+/// dismissed unlock prompt), sign-in still succeeds for this session (the
+/// access token is cached in-process), but the next launch would silently
+/// start signed out: log it and tell the renderer.
+fn save_refresh_token(token: &str) {
+    if let Err(e) = keyring_set(token) {
+        tracing::warn!(error = %e, "could not save the refresh token to the system keychain");
+        emit_event(keychain_failure_event());
     }
 }
 fn keyring_del() {
@@ -303,6 +315,30 @@ fn capture_code() -> Result<Cb, AuthError> {
     })
 }
 
+/// The identity provider's authorize page that sign-in opens in the
+/// browser: `base` is [`auth_base`], with the PKCE `challenge`, the loopback
+/// `redirect_uri` and `state` from [`capture_code`], and the API `resource`.
+fn authorize_url(
+    base: &str,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+    resource: &str,
+) -> Result<url::Url, AuthError> {
+    let mut u = url::Url::parse(&format!("{base}/oauth2/authorize"))
+        .map_err(|e| AuthError::new(e.to_string(), "auth"))?;
+    u.query_pairs_mut()
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", DEFAULT_SCOPES)
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("resource", resource);
+    Ok(u)
+}
+
 pub async fn sign_in() -> Result<Tokens, AuthError> {
     if is_no_auth() {
         return Ok(noauth_tokens());
@@ -310,19 +346,14 @@ pub async fn sign_in() -> Result<Tokens, AuthError> {
     let (verifier, challenge) = new_pkce();
     let cb = capture_code()?;
 
-    let mut u = url::Url::parse(&format!("{}/oauth2/authorize", auth_base()))
-        .map_err(|e| AuthError::new(e.to_string(), "auth"))?;
-    u.query_pairs_mut()
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", &cb.redirect_uri)
-        .append_pair("response_type", "code")
-        .append_pair("scope", DEFAULT_SCOPES)
-        .append_pair("state", &cb.state)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("resource", &resource());
-
-    open::that(u.as_str())
+    let u = authorize_url(
+        &auth_base(),
+        &cb.redirect_uri,
+        &cb.state,
+        &challenge,
+        &resource(),
+    )?;
+    fleetify_backend::open_external::open_url(u.as_str())
         .map_err(|e| AuthError::new(format!("browser-failed: {e}"), "browser"))?;
 
     let rx = cb.rx;
@@ -348,7 +379,7 @@ pub async fn sign_in() -> Result<Tokens, AuthError> {
         .map_err(|e| AuthError::new(e.to_string(), "auth"))?;
     let tokens = decode_token_response(r).await?;
     *cached().lock().unwrap() = Some(tokens.clone());
-    keyring_set(&tokens.refresh_token);
+    save_refresh_token(&tokens.refresh_token);
     Ok(tokens)
 }
 
@@ -394,7 +425,7 @@ pub async fn refresh_if_needed(force: bool) -> Result<Tokens, AuthError> {
         .map_err(|e| AuthError::new(e.to_string(), "auth"))?;
     let tokens = decode_token_response(r).await?;
     *cached().lock().unwrap() = Some(tokens.clone());
-    keyring_set(&tokens.refresh_token);
+    save_refresh_token(&tokens.refresh_token);
     emit_event(serde_json::json!({"kind":"refreshed","expiresAt":tokens.expires_at}));
     Ok(tokens)
 }
@@ -514,5 +545,56 @@ pub async fn get_access_token(force: bool) -> Option<serde_json::Value> {
     match refresh_if_needed(force).await {
         Ok(t) => Some(serde_json::json!({"token": t.access_token, "expiresAt": t.expires_at})),
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sign_in_page_is_a_link_the_opener_accepts() {
+        // Sign-in opens the authorize page through open_external, which
+        // refuses anything but a clean web link: it must not refuse this one.
+        let (_verifier, challenge) = new_pkce();
+        for (base, resource) in [
+            ("https://fleetify.dev/api/auth", "https://fleetify.dev/api"),
+            ("http://localhost:3001/api/auth", "http://127.0.0.1:8765"),
+        ] {
+            let url = authorize_url(
+                base,
+                "http://127.0.0.1:53682/callback",
+                "c3RhdGUtd2l0aC1zb21lLWJ5dGVz",
+                &challenge,
+                resource,
+            )
+            .unwrap();
+            let opened = fleetify_backend::open_external::validate_external_url(url.as_str())
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(opened.as_str(), url.as_str());
+            assert!(opened
+                .as_str()
+                .starts_with(&format!("{base}/oauth2/authorize?")));
+        }
+    }
+
+    /// Tokens the shell requests must pass the embedded backend's checks:
+    /// the backend expects `iss` = the shell's auth base and `aud` = the
+    /// `resource` the shell names. Both read the same environment here.
+    #[test]
+    fn shell_requests_tokens_the_embedded_backend_accepts() {
+        let backend = fleetify_backend::auth::AuthConfig::from_env();
+        assert_eq!(auth_base(), backend.auth_base);
+        assert_eq!(resource(), backend.expected_audience);
+    }
+
+    /// The renderer raises its keychain warning banner on exactly this
+    /// payload (`src/lib/auth-events.ts`).
+    #[test]
+    fn keychain_failure_event_is_the_payload_the_renderer_handles() {
+        assert_eq!(
+            keychain_failure_event(),
+            serde_json::json!({"kind": "keychain-unavailable"})
+        );
     }
 }

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { X, FolderOpen, Clock, ChevronDown, Check, Sparkles, Wand2 } from "lucide-react";
 import { ClaudeLogo, OpenAILogo, KimiLogo } from "@/components/ui/provider-logo";
 import { createSession, fetchClaudeSessions, fetchCodexSessions, apiFetch, type ClaudeSession } from "@/lib/api";
@@ -307,7 +308,9 @@ export function NewAgentView({ onClose }: Props) {
   }, [showTpl]);
   useEffect(() => { setTimeout(() => pathRef.current?.focus(), 80); }, []);
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    // Claim the key, so the chat underneath neither stops its stream nor
+    // answers a pending permission card with it.
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") { claimEscape(e); onClose(); } };
     document.addEventListener("keydown", h); return () => document.removeEventListener("keydown", h);
   }, [onClose]);
   useEffect(() => {
@@ -598,7 +601,7 @@ export function NewAgentView({ onClose }: Props) {
 
       {/* Center wrapper */}
       <div style={{ position:"fixed", inset:0, zIndex:901, display:"flex", alignItems:"center", justifyContent:"center", pointerEvents:"none" }}>
-        <div className="na-md" style={{
+        <div className="na-md" role="dialog" aria-modal="true" aria-label="New Agent" style={{
           pointerEvents:"auto", width:480, maxHeight:"88vh",
           display:"flex", flexDirection:"column",
           background:"var(--card)",

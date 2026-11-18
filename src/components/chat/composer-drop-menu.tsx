@@ -28,6 +28,7 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 
 interface Props {
   /** The trigger element the menu anchors above. */
@@ -94,7 +95,12 @@ export function ComposerDropMenu({ anchorRef, open, onClose, align = "left", sty
       onClose();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      onClose();
     };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);

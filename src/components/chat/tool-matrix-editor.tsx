@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import type { ToolMatrixCapability } from "@/lib/providers-api";
 
 export interface ToolMatrixEditorProps {
@@ -16,7 +17,14 @@ export function ToolMatrixEditor({ matrix, overrides, onChange }: ToolMatrixEdit
     const onDoc = (e: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      setOpen(false);
+    };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);
     return () => {

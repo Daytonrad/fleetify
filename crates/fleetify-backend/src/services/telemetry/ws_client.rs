@@ -10,7 +10,17 @@
 //!   client → server: `{ "v":1, "type":"event", "id":"<uuid>", "payload":{…} }`
 //!   server → client: `{ "v":1, "type":"ack",   "id":"<uuid>" }`
 //!
+//! Consent: nothing here runs while cloud sync is off (`cloud_gate`). The
+//! loop idles without a bearer, a ticket or a socket, and a connected
+//! socket is closed as soon as the gate closes.
+//!
+//! Logging: the bearer and the ticket appear only as `redact_token`
+//! previews. Request and response bodies, response header values and frame
+//! contents are never logged, and the errors the loop logs carry none of
+//! them either.
+//!
 //! Failure modes:
+//! - cloud sync off             → idle until it is turned on; no requests
 //! - bearer not signed in       → long pause; no requests
 //! - bearer fetch / ticket fail → exponential backoff
 //! - WS upgrade 401             → backoff + refresh
@@ -24,21 +34,28 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{device_id, emitters, outbox};
+use super::{cloud_enabled, device_id, emitters, gate_changed, outbox};
 
 pub const WIRE_VERSION: u32 = 1;
 const BACKOFF_INITIAL_S: u64 = 1;
 const BACKOFF_MAX_S: u64 = 30;
 const MAX_EVENTS_PER_FLUSH: i64 = 200;
+/// How long a close frame may take when sync is turned off mid-connection.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The realtime endpoints live on the identity provider's origin:
+/// production in release builds, `FLEETIFY_ISSUER` (default: the local
+/// IdP) in debug builds — the same origin the shell signs in against.
 fn issuer() -> String {
-    std::env::var("FLEETIFY_ISSUER").unwrap_or_else(|_| "https://fleetify.dev".to_string())
+    fleetify_core::endpoints::issuer_origin()
 }
 fn ticket_url() -> String {
     format!("{}/api/realtime/ticket", issuer().trim_end_matches('/'))
 }
 fn ws_url() -> String {
-    let base = issuer();
+    ws_url_for(&issuer())
+}
+fn ws_url_for(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     let url = if let Some(rest) = trimmed.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -59,16 +76,18 @@ pub type BearerSource = Arc<
         + Sync,
 >;
 
-/// Long-running task. Connects to the realtime endpoint, replays the
-/// outbox, listens for acks, reconnects with exponential backoff.
+/// Long-running task. While cloud sync is on: connects to the realtime
+/// endpoint, replays the outbox, listens for acks, reconnects with
+/// exponential backoff. While it is off: waits for it to be turned on.
 /// Never returns (cancellation expected on shutdown).
 pub async fn run_ws_client_loop(bearer_source: BearerSource) {
     let mut backoff_secs = BACKOFF_INITIAL_S;
     loop {
+        wait_until_cloud_enabled().await;
         match one_connection_attempt(&bearer_source).await {
             Ok(_) => {
-                // Clean disconnect (e.g. server closed). Reset backoff so
-                // we reconnect quickly.
+                // Clean disconnect (server closed, or sync turned off).
+                // Reset backoff so we reconnect quickly.
                 backoff_secs = BACKOFF_INITIAL_S;
             }
             Err(e) => {
@@ -80,6 +99,20 @@ pub async fn run_ws_client_loop(bearer_source: BearerSource) {
                 backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_S);
             }
         }
+    }
+}
+
+/// Returns once cloud sync is on. The `notified()` future is created
+/// before the flag is checked: it receives `notify_waiters()` from the
+/// moment it exists, so a gate change landing between the check and the
+/// await still wakes it.
+async fn wait_until_cloud_enabled() {
+    loop {
+        let changed = gate_changed().notified();
+        if cloud_enabled() {
+            return;
+        }
+        changed.await;
     }
 }
 
@@ -97,6 +130,10 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
         target: "fleetify.telemetry.ws",
         "→ bearer acquired (len={}, prefix={})", bearer.len(), bearer_preview
     );
+    // Sync may have been turned off while the bearer was being fetched.
+    if !cloud_enabled() {
+        return Ok(());
+    }
 
     // 1. Fetch a ticket.
     let device = device_id::get_or_create();
@@ -111,6 +148,9 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
         "← ticket acquired (len={}, prefix={})",
         ticket.len(), redact_token(&ticket)
     );
+    if !cloud_enabled() {
+        return Ok(());
+    }
 
     // 2. Open the WS. Ticket is sent as the SECOND value in the
     //    `Sec-WebSocket-Protocol` subprotocol list (cloud's auth
@@ -144,14 +184,15 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
             return Err(anyhow!("WS upgrade failed: {e}"));
         }
     };
+    // Header names only: a value could echo the ticket subprotocol.
     tracing::info!(
         target: "fleetify.telemetry.ws",
         "← ws handshake response status={} headers={:?}",
         handshake_resp.status(),
         handshake_resp
             .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .keys()
+            .map(|k| k.as_str())
             .collect::<Vec<_>>()
     );
     let (mut write, mut read) = ws_stream.split();
@@ -165,8 +206,22 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
     let ping_interval = Duration::from_secs(30);
 
     loop {
+        // Created before the check, like in `wait_until_cloud_enabled`: a
+        // close landing after the check still wakes the select below.
+        let gate = gate_changed().notified();
+        tokio::pin!(gate);
+        if !cloud_enabled() {
+            tracing::info!(
+                target: "fleetify.telemetry.ws",
+                "cloud sync turned off; closing the socket"
+            );
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, write.close()).await;
+            return Ok(());
+        }
         tokio::select! {
             biased;
+            // Gate change: the check at the top of the loop acts on it.
+            _ = &mut gate => {}
             // Outbox drainer
             _ = notify.notified() => {
                 let pending = outbox::peek_pending(MAX_EVENTS_PER_FLUSH).await?;
@@ -175,18 +230,16 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
                 }
                 tracing::info!(target: "fleetify.telemetry.ws", "→ sending {} events", pending.len());
                 for (event_id, payload) in pending {
-                    let envelope = json!({
-                        "v": WIRE_VERSION,
-                        "type": "event",
-                        "id": event_id,
-                        "payload": payload,
-                    });
-                    let frame = serde_json::to_string(&envelope)?;
+                    // Turned off mid-batch: stop here. The purge has
+                    // dropped the rest; the loop top closes the socket.
+                    if !cloud_enabled() {
+                        break;
+                    }
+                    let frame = event_frame(&event_id, &payload)?;
                     tracing::info!(
                         target: "fleetify.telemetry.ws",
-                        "→ send event id={} frame={}",
-                        event_id,
-                        truncate(&frame, 2000)
+                        "→ send {}",
+                        frame_log(&frame)
                     );
                     write.send(Message::Text(frame)).await
                         .map_err(|e| anyhow!("ws send failed: {e}"))?;
@@ -202,7 +255,7 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
                     Message::Text(t) => {
                         tracing::info!(
                             target: "fleetify.telemetry.ws",
-                            "← recv text frame={}", truncate(&t, 2000)
+                            "← recv {}", frame_log(&t)
                         );
                         handle_inbound(&t).await
                     }
@@ -238,6 +291,20 @@ async fn one_connection_attempt(bearer_source: &BearerSource) -> Result<()> {
             }
         }
     }
+}
+
+/// The wire frame for one outbox row. Sends the row's cloud view: new rows
+/// are minimised when queued (and the view leaves them unchanged), but rows
+/// queued by older builds may still carry activity summaries and full
+/// project paths.
+fn event_frame(event_id: &str, payload: &Value) -> Result<String> {
+    let envelope = json!({
+        "v": WIRE_VERSION,
+        "type": "event",
+        "id": event_id,
+        "payload": emitters::cloud_view(payload),
+    });
+    Ok(serde_json::to_string(&envelope)?)
 }
 
 async fn handle_inbound(text: &str) {
@@ -286,14 +353,19 @@ async fn handle_inbound(text: &str) {
 }
 
 async fn fetch_ticket(bearer: &str, device_id: &str) -> Result<String> {
-    let url = ticket_url();
+    fetch_ticket_at(&ticket_url(), bearer, device_id).await
+}
+
+/// [`fetch_ticket`] against `url`, so tests can point it at a local server.
+///
+/// Logs and errors carry the status and, at most, the ticket's redacted
+/// preview: never the body (a server may echo the bearer in an error) or
+/// the response headers.
+async fn fetch_ticket_at(url: &str, bearer: &str, device_id: &str) -> Result<String> {
     let payload = json!({ "deviceId": device_id });
-    tracing::info!(
-        target: "fleetify.telemetry.ws",
-        "→ ticket POST url={} body={}", url, payload
-    );
+    tracing::info!(target: "fleetify.telemetry.ws", "→ ticket POST url={url}");
     let r = reqwest::Client::new()
-        .post(&url)
+        .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
         .json(&payload)
         .timeout(Duration::from_secs(10))
@@ -301,35 +373,38 @@ async fn fetch_ticket(bearer: &str, device_id: &str) -> Result<String> {
         .await
         .map_err(|e| anyhow!("ticket POST failed: {e}"))?;
     let status = r.status();
-    let headers: Vec<(String, String)> = r
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
     let body_text = r.text().await.unwrap_or_default();
+    let body = serde_json::from_str::<Value>(&body_text);
+    let ticket = body
+        .as_ref()
+        .ok()
+        .and_then(|b| b.get("ticket"))
+        .and_then(Value::as_str)
+        .map(String::from);
     tracing::info!(
         target: "fleetify.telemetry.ws",
-        "← ticket response status={} headers={:?} body={}",
-        status, headers, truncate(&body_text, 2000)
+        "← ticket response {}",
+        ticket_response_log(status, ticket.as_deref())
     );
     if !status.is_success() {
         return Err(anyhow!(
-            "ticket POST returned {} ({}); body={}",
+            "ticket POST returned {} ({})",
             status.as_u16(),
-            status.canonical_reason().unwrap_or(""),
-            truncate(&body_text, 500)
+            status.canonical_reason().unwrap_or("")
         ));
     }
-    let body: Value = serde_json::from_str(&body_text).map_err(|e| {
-        anyhow!(
-            "ticket response decode failed: {e}; raw={}",
-            truncate(&body_text, 500)
-        )
-    })?;
-    body.get("ticket")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow!("ticket response missing `ticket` field; got {body}"))
+    // serde_json's message is a position, never the text.
+    body.map_err(|e| anyhow!("ticket response decode failed: {e}"))?;
+    ticket.ok_or_else(|| anyhow!("ticket response has no `ticket` field"))
+}
+
+/// How the ticket endpoint's answer appears in the log: its status and,
+/// when it holds a ticket, that ticket's redacted preview.
+fn ticket_response_log(status: reqwest::StatusCode, ticket: Option<&str>) -> String {
+    match ticket {
+        Some(ticket) => format!("status={} ticket={}", status.as_u16(), redact_token(ticket)),
+        None => format!("status={}", status.as_u16()),
+    }
 }
 
 /// Redact a token/ticket to a `<first8>…<last4>` preview so logs never
@@ -351,6 +426,28 @@ fn redact_token(s: &str) -> String {
     format!("{head}…{tail}")
 }
 
+/// How a WebSocket frame appears in the log: its `type`, its `id` and, for
+/// an event, the payload's `kind`. Never the rest: an event carries session
+/// titles and folder names.
+fn frame_log(text: &str) -> String {
+    let Ok(frame) = serde_json::from_str::<Value>(text) else {
+        return format!("<{} bytes, not JSON>", text.len());
+    };
+    let field = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .map_or_else(|| "-".to_string(), |s| truncate(s, 64))
+    };
+    let mut line = format!(
+        "type={} id={}",
+        field(frame.get("type")),
+        field(frame.get("id"))
+    );
+    if let Some(kind) = frame.get("payload").and_then(|p| p.get("kind")) {
+        line.push_str(&format!(" kind={}", field(Some(kind))));
+    }
+    line
+}
+
 /// Cap log lines at `max` chars so a 2 MB body doesn't fill the
 /// terminal scrollback.
 fn truncate(s: &str, max: usize) -> String {
@@ -362,27 +459,17 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Surface every detail of a tungstenite::Error so the user sees the
-/// 400's response body, headers, and underlying cause.
+/// Log why the WebSocket upgrade failed: the HTTP status, or the
+/// underlying cause when there was no HTTP answer.
 fn log_ws_error(e: &tokio_tungstenite::tungstenite::Error) {
     use tokio_tungstenite::tungstenite::Error as WsErr;
     match e {
+        // The status only: the body or a header could echo the ticket.
         WsErr::Http(resp) => {
-            let status = resp.status();
-            let headers: Vec<(String, String)> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect();
-            let body = resp
-                .body()
-                .as_ref()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default();
             tracing::warn!(
                 target: "fleetify.telemetry.ws",
-                "← ws upgrade HTTP {} headers={:?} body={}",
-                status, headers, truncate(&body, 2000)
+                "← ws upgrade refused: HTTP {}",
+                resp.status()
             );
         }
         other => {
@@ -415,17 +502,266 @@ fn urlencoding_minimal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::telemetry::cloud_gate::test_support::GateGuard;
+    use crate::services::telemetry::set_cloud_enabled;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn ws_loop_stays_idle_while_the_gate_is_closed() {
+        let _g = outbox::tests::TEST_LOCK.lock().await;
+        let _gate = GateGuard::new();
+        set_cloud_enabled(false).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let source: BearerSource = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        });
+
+        let run =
+            tokio::time::timeout(Duration::from_millis(300), run_ws_client_loop(source)).await;
+        assert!(
+            run.is_err(),
+            "the loop never returns; the timeout must fire"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no bearer may be fetched while cloud sync is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_loop_wakes_up_when_the_gate_opens() {
+        let _g = outbox::tests::TEST_LOCK.lock().await;
+        let _gate = GateGuard::new();
+        set_cloud_enabled(false).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        // Not signed in: the loop then pauses for BACKOFF_MAX_S, so it asks once.
+        let source: BearerSource = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        });
+        let task = tokio::spawn(run_ws_client_loop(source));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        set_cloud_enabled(true).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while calls.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "opening the gate must wake the idle loop"
+        );
+    }
+
+    #[test]
+    fn event_frames_send_only_the_cloud_view() {
+        // A row an older build queued: it still has the summary and the full path.
+        let frame = event_frame(
+            "evt-1",
+            &json!({
+                "kind": "activity",
+                "local_session_id": "s1",
+                "activity_kind": "command",
+                "activity_summary": "export TOKEN=x",
+                "project_path": "/home/u/work/fleetify",
+            }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["v"], WIRE_VERSION);
+        assert_eq!(v["type"], "event");
+        assert_eq!(v["id"], "evt-1");
+        assert_eq!(v["payload"]["activity_kind"], "command");
+        assert!(
+            v["payload"].get("activity_summary").is_none(),
+            "summary on the wire: {frame}"
+        );
+        assert_eq!(v["payload"]["project_path"], "fleetify");
+    }
 
     #[test]
     fn ws_url_translates_http_to_ws_and_https_to_wss() {
-        std::env::set_var("FLEETIFY_ISSUER", "https://fleetify.dev");
-        assert_eq!(ws_url(), "wss://fleetify.dev/api/realtime/connect");
-        std::env::set_var("FLEETIFY_ISSUER", "http://localhost:3001");
-        assert_eq!(ws_url(), "ws://localhost:3001/api/realtime/connect");
+        assert_eq!(
+            ws_url_for("https://fleetify.dev"),
+            "wss://fleetify.dev/api/realtime/connect"
+        );
+        assert_eq!(
+            ws_url_for("http://localhost:3001"),
+            "ws://localhost:3001/api/realtime/connect"
+        );
         // Trailing slash + no scheme = ws://.
-        std::env::set_var("FLEETIFY_ISSUER", "127.0.0.1:3001/");
-        assert_eq!(ws_url(), "ws://127.0.0.1:3001/api/realtime/connect");
-        std::env::remove_var("FLEETIFY_ISSUER");
+        assert_eq!(
+            ws_url_for("127.0.0.1:3001/"),
+            "ws://127.0.0.1:3001/api/realtime/connect"
+        );
+    }
+
+    /// Everything logged on this thread while the guard lives, as plain text.
+    struct LogCapture {
+        lines: Arc<std::sync::Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn start() -> Self {
+            let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&lines);
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || CaptureWriter(Arc::clone(&sink)))
+                .finish();
+            Self {
+                lines,
+                _guard: tracing::subscriber::set_default(subscriber),
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.lines.lock().unwrap()).into_owned()
+        }
+    }
+
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const BEARER: &str = "bearer-0123456789-SECRET-abcdef";
+    const TICKET: &str = "tkt_0123456789-SECRET-ticket-wxyz";
+
+    #[tokio::test]
+    async fn the_ticket_response_is_logged_as_its_status_and_a_redacted_preview() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/realtime/ticket"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "session=cookie-SECRET")
+                    .set_body_json(json!({ "ticket": TICKET, "note": "body-SECRET" })),
+            )
+            .mount(&server)
+            .await;
+
+        let logs = LogCapture::start();
+        let ticket = fetch_ticket_at(
+            &format!("{}/api/realtime/ticket", server.uri()),
+            BEARER,
+            "device-1",
+        )
+        .await
+        .unwrap();
+        let text = logs.text();
+
+        assert_eq!(ticket, TICKET);
+        assert!(text.contains("status=200"), "{text}");
+        assert!(text.contains(&redact_token(TICKET)), "{text}");
+        assert!(
+            !text.contains("SECRET"),
+            "a secret or the body was logged: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_ticket_request_logs_and_reports_only_its_status() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A server that echoes the request back in its error.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({ "error": format!("bad token {BEARER}") })),
+            )
+            .mount(&server)
+            .await;
+
+        let logs = LogCapture::start();
+        let err = fetch_ticket_at(&server.uri(), BEARER, "device-1")
+            .await
+            .unwrap_err()
+            .to_string();
+        let text = logs.text();
+
+        // The loop logs this error as is.
+        assert!(err.contains("401"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(text.contains("status=401"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_ticket_response_never_shows_its_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for body in [
+            format!("ticket={TICKET}"),             // not JSON
+            json!({ "token": TICKET }).to_string(), // no `ticket` field
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+                .mount(&server)
+                .await;
+
+            let logs = LogCapture::start();
+            let err = fetch_ticket_at(&server.uri(), BEARER, "device-1")
+                .await
+                .unwrap_err()
+                .to_string();
+            let text = logs.text();
+            assert!(!err.contains("SECRET"), "{body}: {err}");
+            assert!(!text.contains("SECRET"), "{body}: {text}");
+        }
+    }
+
+    #[test]
+    fn frames_are_logged_by_type_id_and_kind_only() {
+        let event = event_frame(
+            "evt-1",
+            &json!({
+                "kind": "session_start",
+                "session_title": "title-SECRET",
+                "project_path": "/home/u/folder-SECRET",
+            }),
+        )
+        .unwrap();
+        let line = frame_log(&event);
+        assert!(line.contains("type=event"), "{line}");
+        assert!(line.contains("id=evt-1"), "{line}");
+        assert!(line.contains("kind=session_start"), "{line}");
+        assert!(!line.contains("SECRET"), "{line}");
+
+        let ack = frame_log(r#"{"v":1,"type":"ack","id":"evt-1"}"#);
+        assert!(
+            ack.contains("type=ack") && ack.contains("id=evt-1"),
+            "{ack}"
+        );
+
+        let raw = frame_log("not json SECRET");
+        assert!(!raw.contains("SECRET"), "{raw}");
+        assert!(raw.contains("15 bytes"), "{raw}");
     }
 
     #[test]

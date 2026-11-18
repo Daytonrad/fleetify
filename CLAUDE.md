@@ -241,22 +241,23 @@ Pre-1.0 this still triggers only a minor bump (we're 0.x — semver lets us brea
 
 ## Telemetry & analytics
 
-Fleetify ships two independent telemetry channels. Both default to user
-choice; neither leaks prompt content, API keys, or file paths.
+Fleetify ships two independent telemetry channels. Dashboard sync is on by
+default and can be turned off in Settings → Privacy; product analytics is
+off until the user turns it on. `docs/ANALYTICS.md` lists what each one
+sends.
 
 | Channel | Vendor | Default | Toggle | Outbox |
 |---|---|---|---|---|
-| Anonymous usage analytics | Fleetify cloud (`fleetify.dev`, WebSocket) | **ON** | Settings → Privacy → "Anonymous usage analytics" | `~/.fleetify/telemetry-outbox.sqlite` |
-| Crash reports | Fleetify cloud | **ON** | Settings → Privacy → "Crash reports" | (same outbox) |
-| Product analytics | PostHog Cloud (US, HTTP `/batch`) | **OFF** | Settings → Privacy → "Product analytics (PostHog)" | `~/.fleetify/posthog-outbox.sqlite` |
+| Dashboard sync | Fleetify cloud (`fleetify.dev`, WebSocket) | **ON** | Settings → Privacy → "Dashboard sync" | `~/.fleetify/telemetry-outbox.sqlite` |
+| Product analytics | PostHog Cloud (US, HTTP `/batch`) | **OFF** | Settings → Privacy → "Product analytics" | `~/.fleetify/posthog-outbox.sqlite` |
 
 ### PostHog integration
 
 - **Code:** backend module at `crates/fleetify-backend/src/services/telemetry/posthog/`; frontend wrapper at `src/lib/posthog.ts`.
 - **Fan-out:** the existing `services/telemetry/emitters.rs::enqueue_payload` writes to both the Fleetify cloud outbox AND the PostHog outbox (the latter via `posthog::enqueue_if_enabled`, gated on a runtime `AtomicBool`).
-- **distinct_id:** the persisted `device_id` from `device.json` is reused on both sides. Frontend `posthog.identify(user_id)` after OAuth merges the anonymous person into the authenticated one via `$anon_distinct_id`.
+- **distinct_id:** the persisted `device_id` from `device.json` is reused on both sides. Frontend `posthog.identify(user_id)` runs at sign-in, at each launch while signed in, and at opt-in, and only while product analytics is on; it merges the anonymous person into the authenticated one via `$anon_distinct_id`, with the id only (`before_send` strips `$set` / `$set_once`).
 - **Env keys:** `POSTHOG_API_KEY` (Rust, runtime `std::env::var`) and `VITE_POSTHOG_KEY` (Vite, `import.meta.env`). Unset → backend `init` short-circuits and the renderer wrapper no-ops. `POSTHOG_HOST` / `VITE_POSTHOG_HOST` default to `https://us.i.posthog.com`.
-- **Runtime gate:** `telemetry_set_posthog_enabled` Tauri command persists the flag in `fleet.config.json::telemetry.posthog_enabled` AND flips the backend's `ENABLED` atomic live. Live opt-out stops new sends within ~10 s; renderer's `optOut()` stops autocapture immediately.
+- **Runtime gate:** `telemetry_set_posthog_enabled` Tauri command persists the flag in `fleet.config.json::telemetry.posthog_enabled` AND flips the backend's `ENABLED` atomic live. Live opt-out stops new sends within ~10 s; the renderer's `optOut()` opts posthog-js out at once and drops every request it would still make, queued events and retries included.
 
 ### Local dev
 

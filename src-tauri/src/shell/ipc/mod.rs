@@ -61,68 +61,180 @@ pub async fn config_get(app: tauri::AppHandle) -> serde_json::Value {
     }
 }
 
+/// Replaces `fleet.config.json` with `config`. A failed save answers
+/// `{ ok: false, error }`.
 #[tauri::command]
 pub async fn config_set(app: tauri::AppHandle, config: serde_json::Value) -> serde_json::Value {
-    if let Ok(dir) = app.path().app_data_dir() {
-        let _ = config::save_config_to(&dir, &config);
+    let saved = match app.path().app_data_dir() {
+        Ok(dir) => config::save_config_to(&dir, &config)
+            .map_err(|e| format!("Couldn't save Fleetify's settings: {e}")),
+        Err(e) => Err(format!("Couldn't find Fleetify's settings folder: {e}")),
+    };
+    match saved {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(error) => {
+            tracing::warn!(error = %error, "settings not saved");
+            serde_json::json!({ "ok": false, "error": error })
+        }
     }
-    serde_json::json!({ "ok": true })
 }
 
-// ── PostHog telemetry config ──────────────────────────────────────
-// Renderer fetches `{ distinct_id, posthog_enabled }` at boot to
-// initialise posthog-js with the same device_id the Rust backend uses,
-// so frontend + backend events flow to one PostHog person. Setter both
-// persists the flag AND flips the backend's runtime gate live so the
-// worker stops / starts without a restart.
+// ── Telemetry config (PostHog + Fleetify cloud sync) ──────────────
+// Renderer fetches `{ distinct_id, posthog_enabled, cloud_enabled }` at
+// boot; `distinct_id` initialises posthog-js with the same device_id the
+// Rust backend uses, so frontend + backend events flow to one PostHog
+// person. Each setter both persists its flag AND flips the matching
+// backend runtime gate live, so the PostHog worker / the cloud WS loop
+// stops or starts without a restart.
 
 #[tauri::command]
-pub async fn telemetry_get_config(app: tauri::AppHandle) -> serde_json::Value {
-    let posthog_enabled = match app.path().app_data_dir() {
-        Ok(dir) => config::telemetry_from(&config::load_config_from(&dir)).posthog_enabled,
-        Err(_) => false,
-    };
+pub async fn telemetry_get_config() -> serde_json::Value {
     let device = fleetify_backend::services::telemetry::device_id::get_or_create();
+    telemetry_config_now(device.device_id)
+}
+
+/// The two flags are the backend's live gates, not the saved choices. They
+/// differ after a failed save (the gate still follows the switch for this
+/// session), and the Settings card has to show what is actually on. The
+/// shell sets both gates from the saved choices as soon as it starts
+/// (lib.rs), before the warm-up, so the renderer's launch read sees them.
+fn telemetry_config_now(distinct_id: String) -> serde_json::Value {
     serde_json::json!({
-        "distinct_id": device.device_id,
-        "posthog_enabled": posthog_enabled,
+        "distinct_id": distinct_id,
+        "posthog_enabled": fleetify_backend::services::telemetry::posthog::is_enabled(),
+        "cloud_enabled": fleetify_backend::services::telemetry::cloud_enabled(),
     })
 }
 
+/// Whether Settings has set cloud sync since launch. The startup restore
+/// (lib.rs) ends seconds after launch, after the warm-up, and must not undo
+/// a choice the user made meanwhile, including one whose save failed. The
+/// setter and the restore both hold this lock while they touch the gate, so
+/// whichever runs second sees the other.
+static CLOUD_SYNC_SET_SINCE_LAUNCH: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+
+/// Settings' change to the cloud gate: records that the user chose, then
+/// applies it.
+async fn set_cloud_sync(set_since_launch: &tokio::sync::Mutex<bool>, enabled: bool) {
+    let mut set = set_since_launch.lock().await;
+    *set = true;
+    fleetify_backend::services::telemetry::set_cloud_enabled(enabled).await;
+}
+
+/// The end of the startup restore. It can only close the gate: when the
+/// saved choice is off (closing also purges what is still queued), and only
+/// if Settings hasn't set it since launch. It never opens the gate; the
+/// early restore already opened it when the saved choice is on.
+async fn finish_cloud_sync_restore_with(
+    set_since_launch: &tokio::sync::Mutex<bool>,
+    saved_on: bool,
+) {
+    let set = set_since_launch.lock().await;
+    if !*set && !saved_on {
+        fleetify_backend::services::telemetry::set_cloud_enabled(false).await;
+    }
+}
+
+pub(crate) async fn finish_cloud_sync_restore(saved_on: bool) {
+    finish_cloud_sync_restore_with(&CLOUD_SYNC_SET_SINCE_LAUNCH, saved_on).await;
+}
+
+/// Settings → Privacy's Fleetify-cloud sync switch. Saves the choice
+/// (`config::persist_cloud_choice`), then sets the backend gate: turning it
+/// off purges anything still queued and drops the dashboard socket.
+///
+/// The gate follows the switch for this session even when the save fails,
+/// but the saved choice then still decides the next launch, so the failure
+/// is reported: `{ ok: false, error }`.
+#[tauri::command]
+pub async fn telemetry_set_cloud_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> serde_json::Value {
+    let saved = match app.path().app_data_dir() {
+        Ok(dir) => config::persist_cloud_choice(&dir, enabled),
+        Err(e) => Err(format!("Couldn't find Fleetify's settings folder: {e}")),
+    };
+    if let Err(error) = &saved {
+        tracing::warn!(
+            error = %error,
+            enabled,
+            "cloud sync setting not saved; it applies until Fleetify restarts"
+        );
+    }
+    set_cloud_sync(&CLOUD_SYNC_SET_SINCE_LAUNCH, enabled).await;
+    match saved {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "error": format!("{error}. The change applies until Fleetify restarts."),
+        }),
+    }
+}
+
+/// Settings → Privacy's product analytics (PostHog) switch. Saves the
+/// choice (`config::persist_posthog_choice`), then flips the backend's
+/// PostHog gate live.
+///
+/// The gate follows the switch for this session even when the save fails,
+/// but the saved choice then still decides the next launch, so the failure
+/// is reported: `{ ok: false, error }`.
 #[tauri::command]
 pub async fn telemetry_set_posthog_enabled(
     app: tauri::AppHandle,
     enabled: bool,
 ) -> serde_json::Value {
-    if let Ok(dir) = app.path().app_data_dir() {
-        let mut cfg = config::load_config_from(&dir);
-        let mut telem = config::telemetry_from(&cfg);
-        let was_enabled = telem.posthog_enabled;
-        telem.posthog_enabled = enabled;
-        // Stamp the first opt-in time so funnels can split "fresh"
-        // consenters from long-standing users. Clearing the flag does
-        // NOT wipe the timestamp — useful for support if the user
-        // toggles off then back on.
-        if enabled && !was_enabled {
-            telem.posthog_enabled_at = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
-            );
-        }
-        config::telemetry_set(&mut cfg, &telem);
-        let _ = config::save_config_to(&dir, &cfg);
+    let saved = match app.path().app_data_dir() {
+        Ok(dir) => config::persist_posthog_choice(&dir, enabled),
+        Err(e) => Err(format!("Couldn't find Fleetify's settings folder: {e}")),
+    };
+    if let Err(error) = &saved {
+        tracing::warn!(
+            error = %error,
+            enabled,
+            "product analytics setting not saved; it applies until Fleetify restarts"
+        );
     }
     fleetify_backend::services::telemetry::posthog::set_enabled(enabled);
-    serde_json::json!({ "ok": true })
+    match saved {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "error": format!("{error}. The change applies until Fleetify restarts."),
+        }),
+    }
 }
 
 // ── shell ─────────────────────────────────────────────────────────
+/// What the renderer is told for a link `shell_open_external` won't open:
+/// anything but a web or email link (see `fleetify_backend::open_external`).
+const LINK_REFUSED: &str = "This link can't be opened: only web and email links are supported.";
+
 #[tauri::command]
 pub async fn shell_open_external(url: String) -> serde_json::Value {
-    match ::open::that(&url) {
-        Ok(_) => serde_json::json!({ "ok": true }),
+    use fleetify_backend::open_external::{open_url, OpenError};
+    match open_url(&url) {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(OpenError::Rejected(_)) => serde_json::json!({ "ok": false, "error": LINK_REFUSED }),
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// What the renderer is told for a path `shell_open_path` won't open.
+const PATH_REFUSED: &str = "This file can't be opened from Fleetify.";
+
+/// Opens a local folder, or a document file, with the system's default
+/// handler: Library → "Open raw file" and the "Open in" menu's "Open folder".
+/// `open_external::open_ui_path` resolves the path and opens it only when it
+/// is an existing folder, or a file with a document extension: on Windows,
+/// ShellExecute runs executables, scripts and shortcuts. A Windows network
+/// path is refused before anything looks at it.
+#[tauri::command]
+pub async fn shell_open_path(path: String) -> serde_json::Value {
+    use fleetify_backend::open_external::{open_ui_path, OpenPathError};
+    match open_ui_path(std::path::Path::new(&path)) {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(OpenPathError::Refused(_)) => serde_json::json!({ "ok": false, "error": PATH_REFUSED }),
         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
     }
 }
@@ -146,13 +258,22 @@ pub async fn shell_show_item_in_folder(path: String) -> serde_json::Value {
     //     which Nautilus/Nemo/Dolphin/Caja all implement. Falls back to
     //     `xdg-open <parent>` (no selection) when the D-Bus service is
     //     unavailable — better than failing entirely on a minimal WM.
-    let p = std::path::PathBuf::from(&path);
-    if !p.exists() {
-        return serde_json::json!({
-            "ok": false,
-            "error": format!("path does not exist: {}", p.display())
-        });
-    }
+    //
+    // The path is checked and resolved first (`open_external::path_to_reveal`):
+    // a Windows network path is refused before anything looks at it, since
+    // even checking that it exists signs in to the host, and the file manager
+    // is handed the resolved path.
+    use fleetify_backend::open_external::{path_to_reveal, PathRefused};
+    let p = match path_to_reveal(std::path::Path::new(&path)) {
+        Ok(resolved) => resolved,
+        Err(PathRefused::Unresolvable(_)) => {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("path does not exist: {path}")
+            });
+        }
+        Err(_) => return serde_json::json!({ "ok": false, "error": PATH_REFUSED }),
+    };
     let result = reveal_in_file_manager(&p);
     match result {
         Ok(()) => serde_json::json!({ "ok": true }),
@@ -207,16 +328,14 @@ fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 // erroring out on a box without a FileManager1
                 // implementation (sway+thunar<4.18, headless CI, etc.).
                 let parent = path.parent().unwrap_or(path);
-                ::open::that(parent)
-                    .map(|_| ())
+                fleetify_backend::open_external::open_path(parent)
                     .map_err(|e| format!("dbus-send unavailable and xdg-open fallback failed: {e}"))
             }
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        ::open::that(path.parent().unwrap_or(path))
-            .map(|_| ())
+        fleetify_backend::open_external::open_path(path.parent().unwrap_or(path))
             .map_err(|e| e.to_string())
     }
 }
@@ -299,7 +418,7 @@ pub async fn clipboard_write(text: String) -> serde_json::Value {
 // panel reports its slot's logical rect; we position the child webview
 // there and keep it in sync on scroll / resize. Login state + a site's
 // remembered theme PERSIST across launches via a fixed profile id.
-const BROWSER_EMBED_LABEL: &str = "browser-embed";
+pub(crate) const BROWSER_EMBED_LABEL: &str = "browser-embed";
 const BROWSER_EMBED_PROFILE: [u8; 16] = *b"fleetbrowser0001";
 // A CURRENT Safari UA so sites (Google) serve their MODERN layout instead of
 // the legacy fallback the bare WKWebView UA gets. Kept as Safari (NOT Chrome)
@@ -1557,10 +1676,11 @@ pub async fn git_open_pr(folder: String, pr_number: Option<i64>) -> serde_json::
 /// link only, omitted → legacy gh-first / link-fallback. Renderer
 /// pulls the value from `localStorage["fleet:github-auth-method"]`
 /// so the onboarding choice is honoured exactly.
-// 8 args is one over the default 7; refactor to a struct is out of scope for this cleanup.
+// 9 args is two over the default 7; refactor to a struct is out of scope for this cleanup.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn git_create_pr(
+    app: tauri::AppHandle,
     folder: String,
     title: String,
     body: Option<String>,
@@ -1570,6 +1690,13 @@ pub async fn git_create_pr(
     tool: Option<String>,
     method: Option<String>,
 ) -> serde_json::Value {
+    // Settings → General → Attribution, read fresh for every PR so a change
+    // applies without a restart. No data dir → the default (on).
+    let attribution = app
+        .path()
+        .app_data_dir()
+        .map(|dir| config::git_attribution_from(&config::load_config_from(&dir)))
+        .unwrap_or(true);
     git::create_pr(
         &PathBuf::from(folder),
         &title,
@@ -1579,6 +1706,7 @@ pub async fn git_create_pr(
         featureBranch.as_deref(),
         tool.as_deref(),
         method.as_deref(),
+        attribution,
     )
     .await
 }
@@ -2446,7 +2574,9 @@ fn strip_ansi(s: &str) -> String {
 // One-time device codes are formatted "XXXX-XXXX" — 4 alphanumerics, a
 // dash, then 4 more. gh prints them after "code:" so we anchor on that.
 fn parse_device_code(line: &str) -> Option<String> {
-    let lower = line.to_lowercase();
+    // ASCII-only lowercasing keeps every byte offset, so `pos` is valid in
+    // `line` too. Unicode lowercasing can change lengths (`İ` 2 → 3 bytes).
+    let lower = line.to_ascii_lowercase();
     let pos = lower.find("code:")?;
     let rest = &line[pos + 5..];
     let candidate: String = rest
@@ -2739,7 +2869,7 @@ pub async fn shell_install_ollama() -> serde_json::Value {
     match res {
         Ok(o) if o.status.success() => serde_json::json!({ "ok": true }),
         _ => {
-            let _ = ::open::that(download_url);
+            let _ = fleetify_backend::open_external::open_url(download_url);
             serde_json::json!({
                 "ok": false,
                 "error": "installer did not complete; opened ollama.com/download"
@@ -3039,7 +3169,7 @@ pub fn logs_open_folder() -> serde_json::Value {
     // Reuse the same OS-correct opener `shell_show_item_in_folder`
     // uses for files: passing the directory reveals it.
     let path_str = log_dir.to_string_lossy().to_string();
-    if let Err(e) = open::that(&path_str) {
+    if let Err(e) = fleetify_backend::open_external::open_path(log_dir) {
         return serde_json::json!({
             "ok": false,
             "error": format!("open log folder: {e}")
@@ -4531,6 +4661,63 @@ pub async fn providers_set_cloudflare_account_id(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_path_that_isnt_a_folder_or_document_is_refused_with_a_message() {
+        // Refused before anything is launched: nothing opens here.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("setup.exe");
+        std::fs::write(&exe, b"").unwrap();
+        for path in [
+            exe.to_string_lossy().into_owned(),
+            dir.path().join("missing.md").to_string_lossy().into_owned(),
+            "notes.md".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                shell_open_path(path.clone()).await,
+                serde_json::json!({ "ok": false, "error": PATH_REFUSED }),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_that_cant_be_shown_is_refused_before_the_file_manager_starts() {
+        // The path is checked and resolved first: nothing is revealed here.
+        // (A relative path is refused even when it exists: it would be
+        // resolved against the working directory.)
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.md").to_string_lossy().into_owned();
+        assert_eq!(
+            shell_show_item_in_folder(missing.clone()).await,
+            serde_json::json!({ "ok": false, "error": format!("path does not exist: {missing}") })
+        );
+        for path in ["notes.md", ""] {
+            assert_eq!(
+                shell_show_item_in_folder(path.to_string()).await,
+                serde_json::json!({ "ok": false, "error": PATH_REFUSED }),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_that_isnt_web_or_mail_is_refused_with_a_message() {
+        // Refused before anything is launched: no browser starts here.
+        for url in [
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "https://x%22&calc.exe&%22y.com/",
+            "",
+        ] {
+            assert_eq!(
+                shell_open_external(url.to_string()).await,
+                serde_json::json!({ "ok": false, "error": LINK_REFUSED }),
+                "{url:?}"
+            );
+        }
+    }
+
     #[test]
     fn ollama_auth_header_only_when_key_present() {
         assert_eq!(
@@ -4698,6 +4885,42 @@ mod tests {
         let v4 = scaffold_plugin_impl(&parent, "other-plugin", &bad);
         assert!(v4["error"].as_str().unwrap().contains("unsafe path"));
     }
+
+    #[test]
+    fn parse_device_code_reads_the_gh_prompt() {
+        assert_eq!(
+            parse_device_code("! First copy your one-time code: ABCD-1234"),
+            Some("ABCD-1234".to_string())
+        );
+        assert_eq!(
+            parse_device_code("code: abcd-1234"),
+            Some("ABCD-1234".to_string())
+        );
+        assert_eq!(
+            parse_device_code("Press Enter to open github.com in your browser..."),
+            None
+        );
+        assert_eq!(parse_device_code("code: ABCD1234"), None);
+    }
+
+    /// Regression: the offset of `code:` came from a Unicode-lowercased copy
+    /// of the line. `İ` lowercases from 2 bytes to 3, so the slice of the
+    /// original line started 5 bytes too far and missed the code.
+    #[test]
+    fn parse_device_code_after_non_ascii_text() {
+        assert_eq!(
+            parse_device_code("İİİİİ code: ABCD-1234"),
+            Some("ABCD-1234".to_string())
+        );
+    }
+
+    /// The same stale offset could land inside a letter or past the end of
+    /// the line, and the panic failed the whole sign-in.
+    #[test]
+    fn parse_device_code_does_not_panic_after_non_ascii_text() {
+        assert_eq!(parse_device_code("İİ code: İİİİ"), None);
+        assert_eq!(parse_device_code("İİİİİİİİİİ code:"), None);
+    }
 }
 
 #[cfg(test)]
@@ -4730,5 +4953,105 @@ mod editor_tests {
             "/no/such/path/zzz-fleet-test".into(),
         ));
         assert_eq!(r["ok"], false);
+    }
+}
+
+#[cfg(test)]
+mod telemetry_config_tests {
+    use super::*;
+    use fleetify_backend::services::telemetry::{cloud_enabled, posthog, set_cloud_enabled};
+
+    use tauri::async_runtime::block_on;
+
+    /// The gates are process-wide, so the tests that flip them take turns.
+    static GATES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Puts both gates back as they were, also when the test fails.
+    struct RestoreGates {
+        posthog: bool,
+        cloud: bool,
+    }
+
+    impl RestoreGates {
+        fn now() -> Self {
+            Self {
+                posthog: posthog::is_enabled(),
+                cloud: cloud_enabled(),
+            }
+        }
+    }
+
+    impl Drop for RestoreGates {
+        fn drop(&mut self) {
+            posthog::set_enabled(self.posthog);
+            block_on(set_cloud_enabled(self.cloud));
+        }
+    }
+
+    #[test]
+    fn telemetry_config_reports_the_live_gates() {
+        let _turn = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreGates::now();
+
+        // After a failed save the gates differ from the saved choices, and a
+        // re-mounted Settings card has to show the gates.
+        posthog::set_enabled(true);
+        block_on(set_cloud_enabled(false));
+        assert_eq!(
+            telemetry_config_now("device-1".into()),
+            serde_json::json!({
+                "distinct_id": "device-1",
+                "posthog_enabled": true,
+                "cloud_enabled": false,
+            })
+        );
+
+        posthog::set_enabled(false);
+        block_on(set_cloud_enabled(true));
+        assert_eq!(
+            telemetry_config_now("device-1".into()),
+            serde_json::json!({
+                "distinct_id": "device-1",
+                "posthog_enabled": false,
+                "cloud_enabled": true,
+            })
+        );
+    }
+    #[test]
+    fn startup_restore_closes_sync_when_the_saved_choice_is_off() {
+        let _turn = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreGates::now();
+        let set_since_launch = tokio::sync::Mutex::new(false);
+        block_on(set_cloud_enabled(true));
+        block_on(finish_cloud_sync_restore_with(&set_since_launch, false));
+        assert!(!cloud_enabled());
+    }
+
+    #[test]
+    fn startup_restore_never_opens_sync() {
+        // The early restore opens the gate when the saved choice is on; the
+        // late one only ever closes it.
+        let _turn = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreGates::now();
+        let set_since_launch = tokio::sync::Mutex::new(false);
+        block_on(set_cloud_enabled(false));
+        block_on(finish_cloud_sync_restore_with(&set_since_launch, true));
+        assert!(!cloud_enabled());
+    }
+
+    #[test]
+    fn startup_restore_keeps_a_choice_made_in_settings_since_launch() {
+        // The save failed, so the saved choice still says the opposite of
+        // what the user picked this session. The restore must not undo it.
+        let _turn = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreGates::now();
+        let set_since_launch = tokio::sync::Mutex::new(false);
+        block_on(set_cloud_sync(&set_since_launch, true));
+        block_on(finish_cloud_sync_restore_with(&set_since_launch, false));
+        assert!(cloud_enabled(), "a turned-on gate stays on");
+
+        block_on(set_cloud_sync(&set_since_launch, false));
+        block_on(finish_cloud_sync_restore_with(&set_since_launch, true));
+        assert!(!cloud_enabled(), "a turned-off gate stays off");
     }
 }

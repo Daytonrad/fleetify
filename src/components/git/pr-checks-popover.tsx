@@ -15,6 +15,7 @@
  * open/close and supplies the (already normalized) runs.
  */
 import { Fragment, useEffect, useRef, useState } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { Check, X, Loader2, ExternalLink, RotateCw } from "lucide-react";
 import type { CSSProperties } from "react";
 import type { CheckRun } from "@/lib/git-api";
@@ -88,7 +89,12 @@ export function PrChecksPopover({
       if (ref.current && !ref.current.contains(e.target as Node)) onDismiss();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onDismiss();
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      onDismiss();
     };
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onKey);

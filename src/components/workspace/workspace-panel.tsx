@@ -15,6 +15,7 @@ import remarkGfm from "remark-gfm";
 import { useAppStore, type WorkspaceView } from "@/stores/app-store";
 import { formatShortcut } from "@/lib/keyboard-shortcuts";
 import { usePaneSessionId, useIsInPane } from "@/components/chat/pane-session-context";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { useActiveCwd } from "@/components/workspace/use-active-cwd";
 import { PaneCloseContext } from "@/components/workspace/pane-close-context";
 import { PreviewView } from "@/components/workspace/views/preview-view";
@@ -27,7 +28,10 @@ import {
 } from "@/lib/api";
 import { XtermShell } from "@/components/workspace/xterm-shell";
 import { useChatStore, selectSession, type ProcessEvent } from "@/stores/chat-store";
+import { usePinnedSession } from "@/lib/session-pins";
+import { parseStoredMessages } from "@/lib/session-messages";
 import { MessageContent, StreamingMessage } from "@/components/chat/message-content";
+import { MarkdownLink } from "@/components/markdown-link";
 import { wsManager } from "@/services/ws-manager";
 import { useThemeStore } from "@/stores/theme-store";
 import { getTheme } from "@/lib/themes";
@@ -125,7 +129,13 @@ function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: Ct
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(); };
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Claim the key so closing the menu does nothing else: the chat beside
+      // it keeps streaming. This document listener runs before its window one.
+      claimEscape(e);
+      onClose();
+    };
     document.addEventListener("mousedown", handler);
     document.addEventListener("keydown", esc);
     return () => { document.removeEventListener("mousedown", handler); document.removeEventListener("keydown", esc); };
@@ -415,7 +425,8 @@ const iconBtn: React.CSSProperties = {
 };
 
 /* ─── File Tree Sidebar ─── */
-function FileTree({ root, selectedPath, onSelect }: {
+/** Shelved with QuadrantWorkspace (unrouted). Exported for tests. */
+export function FileTree({ root, selectedPath, onSelect }: {
   root: string; selectedPath: string; onSelect: (e: FsEntry) => void;
 }) {
   const [entries, setEntries] = useState<FsEntry[]>([]);
@@ -586,8 +597,9 @@ async function getLanguageExtension(ext: string) {
 /* ── Per-Fleet-theme CodeMirror skin ──
    Uses oneDark highlight style (syntax colors) on all dark themes,
    but overrides the background/gutter/cursor to match the active Fleet theme.
+   Exported for tests.
 */
-async function buildEditorExtensions(
+export async function buildEditorExtensions(
   colorThemeId: string,
   isDark: boolean,
   ext: string,
@@ -2137,7 +2149,7 @@ function PlanWorkspace({ sessionId }: { sessionId: string | null }) {
   );
 }
 
-const planMdComponents = {
+export const planMdComponents = {
   h1: ({ children }: { children?: React.ReactNode }) => <h1 style={{ fontSize:17, fontWeight:700, letterSpacing:"-0.015em", margin:"4px 0 12px", color:"var(--foreground)" }}>{children}</h1>,
   h2: ({ children }: { children?: React.ReactNode }) => <h2 style={{ fontSize:14, fontWeight:600, letterSpacing:"-0.01em", margin:"20px 0 8px", color:"var(--foreground)" }}>{children}</h2>,
   h3: ({ children }: { children?: React.ReactNode }) => <h3 style={{ fontSize:12.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em", margin:"18px 0 6px", color:"var(--muted-foreground)" }}>{children}</h3>,
@@ -2147,6 +2159,7 @@ const planMdComponents = {
   li: ({ children }: { children?: React.ReactNode }) => <li style={{ margin:"3px 0", color:"var(--card-foreground)" }}>{children}</li>,
   strong: ({ children }: { children?: React.ReactNode }) => <strong style={{ fontWeight:600, color:"var(--foreground)" }}>{children}</strong>,
   em: ({ children }: { children?: React.ReactNode }) => <em style={{ color:"var(--card-foreground)" }}>{children}</em>,
+  a: ({ href, children }: { href?: string; children?: React.ReactNode }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
   code: ({ children, className }: { children?: React.ReactNode; className?: string }) => {
     const isBlock = !!className;
     if (isBlock) {
@@ -3107,8 +3120,10 @@ function AgentPaneView({ sessionId }: { sessionId: string | null }) {
  * messages directly (full detail). Otherwise we fall back to the
  * compact `task.content` log that Claude SDK Task tool / Codex
  * spawnAgent dispatches populate.
+ *
+ * Exported for its unit test only.
  */
-function SubagentContent({ task }: { task: import("@/stores/chat-store").SubagentTask }) {
+export function SubagentContent({ task }: { task: import("@/stores/chat-store").SubagentTask }) {
   // Stable refs — selectors that returned `??[]`/`find()` re-create a
   // value every render, so Zustand sees a new reference each tick and
   // re-runs the component forever. Pull the slice directly; let it be
@@ -3117,6 +3132,12 @@ function SubagentContent({ task }: { task: import("@/stores/chat-store").Subagen
   const workerSessionState = useChatStore(s => s.sessions[task.id]);
   const workerMessages = workerSessionState?.messages;
   const setMessages = useChatStore(s => s.setMessages);
+  // A Fleet worker is normally not the active, staff or split-pane session, so
+  // once it stops streaming the inactive-session sweep would empty its
+  // transcript, and this pane would drop to the lossy dispatch log below. Pin
+  // it while the pane shows it. A sub-agent with no session of its own has
+  // nothing to pin.
+  usePinnedSession(workerSession ? task.id : null);
 
   // When the task is backed by a real session (Fleet dispatch) but
   // chat-store hasn't loaded its messages yet (user never opened it),
@@ -3126,19 +3147,34 @@ function SubagentContent({ task }: { task: import("@/stores/chat-store").Subagen
   // lossy — no tool inputs/outputs).
   const taskId = task.id;
   const needsFetch = !!workerSession && (!workerMessages || workerMessages.length === 0);
-  const [fetchedFor, setFetchedFor] = useState<string | null>(null);
+  // The task id last fetched for: at most one fetch per task id. A ref, not
+  // state, so recording the attempt cannot re-run this effect. When it was
+  // state in the deps, the re-run's cleanup cancelled the fetch it had just
+  // started, and its result never landed. The cleanup still drops a late
+  // result once the task changes, the pane unmounts, or the fetch is no longer
+  // needed (a fresher transcript streamed in first). A fetch dropped before it
+  // settled gives the slot back, so returning to the task fetches it again.
+  const fetchedFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!needsFetch || fetchedFor === taskId) return;
+    if (!needsFetch || fetchedFor.current === taskId) return;
+    fetchedFor.current = taskId;
     let cancelled = false;
-    setFetchedFor(taskId);
+    // Set first thing in the handlers: storing the rows re-renders, and the
+    // cleanup that re-render runs must already see the fetch as settled.
+    let settled = false;
     fetchMessages(taskId).then(rows => {
+      settled = true;
       if (cancelled) return;
       if (Array.isArray(rows) && rows.length > 0) {
-        setMessages(taskId, rows as Parameters<typeof setMessages>[1]);
+        // The endpoint returns `content` as JSON text; MessageContent needs blocks.
+        setMessages(taskId, parseStoredMessages(rows));
       }
-    }).catch(() => { /* best-effort */ });
-    return () => { cancelled = true; };
-  }, [taskId, needsFetch, fetchedFor, setMessages]);
+    }).catch(() => { settled = true; /* best-effort */ });
+    return () => {
+      cancelled = true;
+      if (!settled && fetchedFor.current === taskId) fetchedFor.current = null;
+    };
+  }, [taskId, needsFetch, setMessages]);
 
   // Prefer the worker session's full chat history when available —
   // that's what surfaces every tool call with its real input + output,
@@ -4200,7 +4236,8 @@ function PlaceholderView({ view }: { view: WorkspaceView }) {
    nails the chrome (tabs, actions, frame) and mounts a placeholder
    stream so the surface reads correctly at first paint.
    ══════════════════════════════════════════════════════════ */
-function TerminalView() {
+/** Exported for tests. */
+export function TerminalView() {
   const requestClose = useContext(PaneCloseContext);
 
   // Resolve the cwd the shell should open in. Preference order:
@@ -4236,7 +4273,14 @@ function TerminalView() {
     const onDoc = (e: MouseEvent) => {
       if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) setPickerOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setPickerOpen(false); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Claim the key so closing the picker does nothing else: the chat
+      // beside it keeps streaming. This document listener runs before its
+      // window one.
+      claimEscape(e);
+      setPickerOpen(false);
+    };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);
     return () => {
@@ -5551,7 +5595,7 @@ function FileView() {
 /* Renders markdown source as a styled document matching the sidebar
    dark theme. Used by FileView when a .md/.mdx file is open in preview
    mode. Reuses the ReactMarkdown + remark-gfm already loaded for chat. */
-function MarkdownPreview({ source }: { source: string }) {
+export function MarkdownPreview({ source }: { source: string }) {
   const c: React.CSSProperties = {
     flex: 1, minHeight: 0,
     overflowY: "auto",
@@ -5612,9 +5656,9 @@ function MarkdownPreview({ source }: { source: string }) {
             );
           },
           a: ({ href, children }) => (
-            <a href={href} style={{ color: "#a78bfa", textDecoration: "underline", textDecorationColor: "rgba(167,139,250,0.35)" }}>
+            <MarkdownLink href={href} style={{ color: "#a78bfa", textDecoration: "underline", textDecorationColor: "rgba(167,139,250,0.35)" }}>
               {children}
-            </a>
+            </MarkdownLink>
           ),
           table: ({ children }) => (
             <div style={{

@@ -15,6 +15,7 @@
  * are set without opening the popover.
  */
 import { useEffect, useRef, useState } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { ScrollText } from "lucide-react";
 import { getSessionRules, setSessionRules } from "@/lib/api";
 
@@ -57,7 +58,12 @@ export function SessionRulesChip({ sessionId }: { sessionId: string }) {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      setOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);

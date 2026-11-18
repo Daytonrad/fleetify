@@ -128,10 +128,17 @@ interface FleetConfig {
   updatesAuto?: boolean;
   /** Update channel — Stable / Beta / Canary. Default "stable". */
   updatesChannel?: "stable" | "beta" | "canary";
-  /** Anonymous usage analytics opt-out. Default true (opt-in by install). */
+  /** Legacy: written by the old privacy card's analytics switch; nothing
+   *  writes it now. An explicit `false` still means dashboard sync off
+   *  while no newer choice is saved (`cloud_sync_from` in the shell). */
   telemetryEnabled?: boolean;
-  /** Crash report opt-out. Default true (opt-in by install). */
+  /** Legacy: written by the old "Crash reports" switch. Nothing reads it. */
   crashReportsEnabled?: boolean;
+  /** Credit Fleetify in the commits it makes (`Co-Authored-By: Fleetify`
+   *  trailer) and the pull requests it opens (footer). Default true;
+   *  anything but `false` counts as on. Read by the shell on every
+   *  Create-PR. Settings → General → Attribution. */
+  gitAttribution?: boolean;
 }
 
 interface Window {
@@ -147,21 +154,32 @@ interface Window {
       files: Record<string, string>;
     }) => Promise<{ path?: string; written?: string[]; error?: string }>;
     getConfig: () => Promise<FleetConfig | null>;
-    setConfig: (config: FleetConfig) => Promise<boolean>;
+    /** Replaces fleet.config.json. A save that failed answers
+     *  `{ ok: false, error }` instead of throwing. */
+    setConfig: (config: FleetConfig) => Promise<{ ok: boolean; error?: string }>;
     /** Read backend-owned telemetry config: stable per-machine
-     *  distinct_id (= device.json device_id) and persisted PostHog
-     *  opt-in flag. Called once at boot to bootstrap posthog-js with
-     *  the same id the Rust sink uses. */
+     *  distinct_id (= device.json device_id), and whether product
+     *  analytics (PostHog) and Fleetify cloud sync are on right now (the
+     *  backend's live gates). Called at boot to decide whether to start
+     *  posthog-js, with the same id the Rust sink uses. */
     telemetryGetConfig?: () => Promise<{
       distinct_id: string;
       posthog_enabled: boolean;
+      cloud_enabled: boolean;
     }>;
     /** Flip the persisted PostHog opt-in AND the backend's live
      *  runtime gate. Used by the onboarding consent step and the
-     *  Privacy settings toggle. */
+     *  Privacy settings toggle. `ok: false` means the gate changed but
+     *  the choice wasn't saved, so it lasts until Fleetify restarts. */
     telemetrySetPosthogEnabled?: (
       enabled: boolean
-    ) => Promise<{ ok: boolean }>;
+    ) => Promise<import("@/lib/privacy-choice").PrivacySaveResult>;
+    /** Flip the persisted Fleetify cloud sync switch AND the backend's
+     *  live gate. Turning it off purges anything still queued. Resolves
+     *  like `telemetrySetPosthogEnabled`. */
+    telemetrySetCloudEnabled?: (
+      enabled: boolean
+    ) => Promise<import("@/lib/privacy-choice").PrivacySaveResult>;
     openFolderDialog: () => Promise<string | null>;
     setWindowSize: (
       width: number,
@@ -283,6 +301,9 @@ interface Window {
     ) => () => void;
     openExternal: (url: string) => Promise<boolean>;
     showItemInFolder: (path: string) => Promise<boolean>;
+    /** Open a local folder, or a document file (Markdown, JSON, TOML, YAML,
+     *  text…), with the system's default handler. Anything else is refused. */
+    openPath: (path: string) => Promise<{ ok: boolean; error?: string }>;
     writeText: (text: string) => Promise<boolean>;
 
     // ── PTY bridge ──

@@ -408,9 +408,11 @@ pub async fn get_context(folder: &Path) -> Value {
         json!(branch)
     };
 
+    // The renderer gets this URL: without the credentials an origin remote
+    // can hold (`https://user:token@…`).
     let (rc_r, remote, _) = git(&["remote", "get-url", "origin"], folder).await;
     let remote_https = if rc_r == 0 {
-        Some(ssh_to_https(remote.trim()))
+        Some(without_credentials(&ssh_to_https(remote.trim())))
     } else {
         None
     };
@@ -737,11 +739,26 @@ pub async fn diff_summary(folder: &Path, base: &str) -> Value {
 
 /// Browser target for "Open PR": the exact `/pull/<n>` page when the
 /// caller knows the PR number, the repo's `/pulls` list as the last
-/// resort (no PR exists yet, or resolution failed).
+/// resort (no PR exists yet, or resolution failed). Built without the
+/// credentials an origin remote can hold (`https://user:token@…`): the page
+/// is opened in the browser and handed back to the renderer.
 fn pr_page_url(repo_url: &str, pr_number: Option<i64>) -> String {
+    let repo_url = without_credentials(repo_url);
     match pr_number {
         Some(n) => format!("{repo_url}/pull/{n}"),
         None => format!("{repo_url}/pulls"),
+    }
+}
+
+/// `url` without its username and password, when it has any.
+fn without_credentials(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        _ => url.to_string(),
     }
 }
 
@@ -769,27 +786,49 @@ pub async fn open_pr(folder: &Path, pr_number: Option<i64>) -> Value {
             pr_page_url(&url, None)
         }
     };
-    match ::open::that(&target) {
-        Ok(_) => json!({ "ok": true, "url": target }),
+    open_pr_page(target)
+}
+
+/// Opens the PR page at `target` in the browser. It is built from the
+/// repository's remote URL or from `gh` output, so the repository controls
+/// it: `open_external` refuses anything but a clean web link.
+fn open_pr_page(target: String) -> Value {
+    match fleetify_backend::open_external::open_url(&target) {
+        Ok(()) => json!({ "ok": true, "url": target }),
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
     }
 }
 
 // ── Fleetify attribution helpers ─────────────────────────────────
+// `enabled` is the user's Settings → General → Attribution choice (config
+// key `gitAttribution`, on by default), read once per IPC command. When it is
+// off, both helpers return the trimmed input unchanged.
 const FLEETIFY_CO_AUTHOR: &str = "Co-Authored-By: Fleetify <noreply@fleetify.dev>";
 const FLEETIFY_PR_FOOTER: &str = "\n\n---\nCreated with [Fleetify](https://fleetify.dev)";
 
-fn with_fleetify_trailer(message: &str) -> String {
+/// True when `message` already has a `Co-Authored-By: Fleetify <…>` trailer,
+/// matched case-insensitively on the key and name whatever the address, so a
+/// commit never credits Fleetify twice.
+fn has_fleetify_co_author(message: &str) -> bool {
+    message.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_lowercase()
+            .strip_prefix("co-authored-by:")
+            .is_some_and(|rest| rest.trim_start().starts_with("fleetify <"))
+    })
+}
+
+fn with_fleetify_trailer(message: &str, enabled: bool) -> String {
     let trimmed = message.trim_end();
-    if trimmed.contains("Fleetify <noreply@fleetify.dev>") {
+    if !enabled || has_fleetify_co_author(trimmed) {
         return trimmed.to_string();
     }
     format!("{trimmed}\n\n{FLEETIFY_CO_AUTHOR}")
 }
 
-fn with_fleetify_footer(body: &str) -> String {
+fn with_fleetify_footer(body: &str, enabled: bool) -> String {
     let trimmed = body.trim_end();
-    if trimmed.contains("fleetify.dev") || trimmed.contains("github.com/fleetifyai") {
+    if !enabled || trimmed.contains("fleetify.dev") || trimmed.contains("github.com/fleetifyai") {
         return trimmed.to_string();
     }
     format!("{trimmed}{FLEETIFY_PR_FOOTER}")
@@ -870,7 +909,9 @@ fn write_gitignore_if_missing(folder: &Path) -> bool {
 // `localStorage["fleet:github-auth-method"]` so the onboarding choice is
 // honoured exactly — picking "Use GitHub CLI" never silently routes
 // through OAuth, and vice versa.
-// 8 args is one over the default 7; refactor to a struct is out of scope for this cleanup.
+// `attribution` is the user's `gitAttribution` setting: whether the commits
+// this flow makes (both paths) and the PR footer (gh path) credit Fleetify.
+// 9 args is two over the default 7; refactor to a struct is out of scope for this cleanup.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_pr(
     folder: &Path,
@@ -881,6 +922,7 @@ pub async fn create_pr(
     feature_branch: Option<&str>,
     tool: Option<&str>,
     method: Option<&str>,
+    attribution: bool,
 ) -> Value {
     let want_gh = matches!(method, Some("gh") | Some("cli"));
     let want_oauth = matches!(method, Some("oauth") | Some("link"));
@@ -914,7 +956,17 @@ pub async fn create_pr(
             });
         }
         tracing::info!(target: "createPR", "dispatch-gh (requested)");
-        return create_pr_via_gh(folder, title, body, base, draft, feature_branch, tool).await;
+        return create_pr_via_gh(
+            folder,
+            title,
+            body,
+            base,
+            draft,
+            feature_branch,
+            tool,
+            attribution,
+        )
+        .await;
     }
     if want_oauth {
         let Some(token) = oauth_token else {
@@ -925,7 +977,8 @@ pub async fn create_pr(
             });
         };
         tracing::info!(target: "createPR", "dispatch-link (requested)");
-        let preflight = ensure_repo_for_link(folder, title, base, feature_branch, tool).await;
+        let preflight =
+            ensure_repo_for_link(folder, title, base, feature_branch, tool, attribution).await;
         if let Some(err) = preflight {
             return err;
         }
@@ -943,11 +996,22 @@ pub async fn create_pr(
     // No preference — legacy gh-first then link fallback.
     if gh_authed {
         tracing::info!(target: "createPR", "dispatch-gh (fallback)");
-        return create_pr_via_gh(folder, title, body, base, draft, feature_branch, tool).await;
+        return create_pr_via_gh(
+            folder,
+            title,
+            body,
+            base,
+            draft,
+            feature_branch,
+            tool,
+            attribution,
+        )
+        .await;
     }
     if let Some(token) = oauth_token {
         tracing::info!(target: "createPR", "dispatch-link (fallback)");
-        let preflight = ensure_repo_for_link(folder, title, base, feature_branch, tool).await;
+        let preflight =
+            ensure_repo_for_link(folder, title, base, feature_branch, tool, attribution).await;
         if let Some(err) = preflight {
             return err;
         }
@@ -980,6 +1044,7 @@ async fn ensure_repo_for_link(
     base: Option<&str>,
     feature_branch: Option<&str>,
     tool: Option<&str>,
+    attribution: bool,
 ) -> Option<Value> {
     let _ = (title, base);
     if !folder.exists() {
@@ -1084,7 +1149,7 @@ async fn ensure_repo_for_link(
                 Duration::from_secs(10),
             )
             .await;
-            let baseline_msg = with_fleetify_trailer("chore: initialize repository");
+            let baseline_msg = with_fleetify_trailer("chore: initialize repository", attribution);
             let (rc, _, err) = run(
                 "git",
                 &["commit", "--allow-empty", "-m", &baseline_msg],
@@ -1125,7 +1190,7 @@ async fn ensure_repo_for_link(
                 Duration::from_secs(10),
             )
             .await;
-            let baseline_msg = with_fleetify_trailer("chore: initialize repository");
+            let baseline_msg = with_fleetify_trailer("chore: initialize repository", attribution);
             let (rc, _, err) = run(
                 "git",
                 &["commit", "--allow-empty", "-m", &baseline_msg],
@@ -1192,7 +1257,7 @@ async fn ensure_repo_for_link(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| "Working session updates".to_string());
-        let commit_msg = with_fleetify_trailer(&msg);
+        let commit_msg = with_fleetify_trailer(&msg, attribution);
         let (rc, _, err) = run(
             "git",
             &["commit", "-m", &commit_msg],
@@ -1217,7 +1282,9 @@ async fn ensure_repo_for_link(
 /// PR-summary fallback when body is empty, and finally invokes
 /// `gh pr create`. Every step gets a trace line in the error message
 /// and a tracing breadcrumb so the user can diagnose without log
-/// spelunking.
+/// spelunking. `attribution` gates the Fleetify commit trailer and PR footer.
+// 8 args is one over the default 7; refactor to a struct is out of scope for this cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_pr_via_gh(
     folder: &Path,
     title: &str,
@@ -1226,6 +1293,7 @@ pub async fn create_pr_via_gh(
     draft: bool,
     feature_branch: Option<&str>,
     tool: Option<&str>,
+    attribution: bool,
 ) -> Value {
     const HANDLER_VERSION: &str = "rust-v1-2026-05-20";
     if title.trim().is_empty() {
@@ -1412,7 +1480,7 @@ pub async fn create_pr_via_gh(
                 Duration::from_secs(10),
             )
             .await;
-            let baseline_msg = with_fleetify_trailer("chore: initialize repository");
+            let baseline_msg = with_fleetify_trailer("chore: initialize repository", attribution);
             let (rc, _, err) = run(
                 "git",
                 &["commit", "--allow-empty", "-m", &baseline_msg],
@@ -1441,7 +1509,7 @@ pub async fn create_pr_via_gh(
             // static "Initial commit").
         } else {
             let (_, _, _) = run("git", &["add", "-A"], folder, Duration::from_secs(120)).await;
-            let init_msg = with_fleetify_trailer("Initial commit");
+            let init_msg = with_fleetify_trailer("Initial commit", attribution);
             let (rc, _, err) = run(
                 "git",
                 &["commit", "--allow-empty", "-m", &init_msg],
@@ -1499,7 +1567,7 @@ pub async fn create_pr_via_gh(
                 Duration::from_secs(10),
             )
             .await;
-            let baseline_msg = with_fleetify_trailer("chore: initialize repository");
+            let baseline_msg = with_fleetify_trailer("chore: initialize repository", attribution);
             let (rc, _, err) = run(
                 "git",
                 &["commit", "--allow-empty", "-m", &baseline_msg],
@@ -1608,7 +1676,7 @@ pub async fn create_pr_via_gh(
             _ => "Working session updates".to_string(),
         };
         note("commit message", true, &msg);
-        let commit_msg = with_fleetify_trailer(&msg);
+        let commit_msg = with_fleetify_trailer(&msg, attribution);
         let (rc, _, err) = run(
             "git",
             &["commit", "-m", &commit_msg],
@@ -1849,7 +1917,7 @@ pub async fn create_pr_via_gh(
         }
     }
 
-    let body_with_footer = with_fleetify_footer(&final_body);
+    let body_with_footer = with_fleetify_footer(&final_body, attribution);
 
     // 7. gh pr create.
     let mut args: Vec<String> = vec![
@@ -2662,6 +2730,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pr_page_a_remote_crafted_is_refused_not_opened() {
+        // A remote URL can carry a `"` into the host; on Windows the old
+        // opener handed it to `cmd`. Refused before anything is launched.
+        let crafted = r#"https://x"&calc.exe&"y.com/owner/repo/pull/1"#.to_string();
+        let answer = open_pr_page(crafted);
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("can't be opened")),
+            "{answer}"
+        );
+    }
+
+    #[test]
     fn parse_actions_run_job_extracts_ids() {
         assert_eq!(
             parse_actions_run_job("https://github.com/o/r/actions/runs/123/job/456"),
@@ -2685,6 +2768,48 @@ mod tests {
             (None, None)
         );
         assert_eq!(parse_actions_run_job("garbage"), (None, None));
+    }
+
+    #[test]
+    fn trailer_added_when_enabled() {
+        assert_eq!(
+            with_fleetify_trailer("feat: x", true),
+            "feat: x\n\nCo-Authored-By: Fleetify <noreply@fleetify.dev>"
+        );
+    }
+
+    #[test]
+    fn trailer_skipped_when_disabled() {
+        assert_eq!(with_fleetify_trailer("feat: x\n", false), "feat: x");
+    }
+
+    #[test]
+    fn trailer_not_duplicated_when_any_fleetify_coauthor_is_present() {
+        let m = "feat: x\n\nCo-authored-by: Fleetify <noreply@fleetify.dev>";
+        assert_eq!(with_fleetify_trailer(m, true), m);
+    }
+
+    #[test]
+    fn trailer_dedupe_ignores_case_and_address() {
+        // Any existing Fleetify co-author line counts, whatever its casing or
+        // address, so a commit never ends up crediting Fleetify twice.
+        let lower = "feat: x\n\nco-authored-by: fleetify <noreply@fleetify.dev>";
+        assert_eq!(with_fleetify_trailer(lower, true), lower);
+        let other = "feat: x\n\nCo-Authored-By: Fleetify <older identity>";
+        assert_eq!(with_fleetify_trailer(other, true), other);
+    }
+
+    #[test]
+    fn footer_skipped_when_disabled() {
+        assert_eq!(with_fleetify_footer("body", false), "body");
+    }
+
+    #[test]
+    fn footer_added_when_enabled() {
+        assert_eq!(
+            with_fleetify_footer("body\n", true),
+            "body\n\n---\nCreated with [Fleetify](https://fleetify.dev)"
+        );
     }
 
     #[test]
@@ -3012,6 +3137,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pr_page_carries_no_credentials_from_the_remote() {
+        // An origin remote can hold a token: https://user:token@github.com/…
+        assert_eq!(
+            pr_page_url("https://user:tok@github.com/foo/bar", Some(1)),
+            "https://github.com/foo/bar/pull/1"
+        );
+        assert_eq!(
+            pr_page_url("https://tok@github.com/foo/bar", None),
+            "https://github.com/foo/bar/pulls"
+        );
+    }
+
+    #[test]
     fn pr_page_url_targets_exact_pr_or_pulls_list() {
         assert_eq!(
             pr_page_url("https://github.com/foo/bar", Some(1)),
@@ -3050,6 +3188,22 @@ mod tests {
         // (and the field is always present so the renderer can read it).
         assert_eq!(v["baseBehind"], 0);
         assert!(v.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_context_carries_no_credentials_from_the_remote() {
+        // The renderer gets remoteHttpsUrl: an origin remote like
+        // https://user:token@host/… must not hand it the token.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        fresh_repo(tmp.path()).await;
+        let remote = "https://user:tok@github.com/foo/bar.git";
+        let (rc, _, err) = git(&["remote", "add", "origin", remote], tmp.path()).await;
+        assert_eq!(rc, 0, "git remote add: {err}");
+        let v = get_context(tmp.path()).await;
+        assert_eq!(v["remoteHttpsUrl"], "https://github.com/foo/bar.git");
     }
 
     #[test]
@@ -3185,6 +3339,7 @@ mod tests {
             Some("main"),
             Some("fleet/x-ab12"),
             None,
+            true,
         )
         .await;
         assert!(res.is_none(), "bootstrap should succeed: {res:?}");
@@ -3209,6 +3364,41 @@ mod tests {
             current_branch_str(tmp.path()).await.as_deref(),
             Some("fleet/x-ab12")
         );
+    }
+
+    /// The link-path bootstrap commits honour the attribution setting: the
+    /// baseline commit credits Fleetify only while attribution is on.
+    #[tokio::test]
+    async fn link_bootstrap_trailer_follows_attribution_setting() {
+        if !git_available() {
+            return;
+        }
+        for attribution in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            // Skip if an ancestor repo would mask our fresh-init state.
+            if fleetify_backend::services::worktree::is_git_repo(&tmp.path().to_string_lossy())
+                .await
+            {
+                return;
+            }
+            let res = ensure_repo_for_link(
+                tmp.path(),
+                "My Feature",
+                Some("main"),
+                Some("fleet/x-ab12"),
+                None,
+                attribution,
+            )
+            .await;
+            assert!(res.is_none(), "bootstrap should succeed: {res:?}");
+            let (_, log, _) = git(&["log", "--all", "--format=%B"], tmp.path()).await;
+            assert_eq!(
+                log.to_ascii_lowercase()
+                    .contains("co-authored-by: fleetify <"),
+                attribution,
+                "attribution={attribution}, commit messages: {log:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -29,7 +29,11 @@ futures-util = "0.3"
 chromiumoxide = "0.9"
 http = "1"
 regex = "1"
-open = "5"
+# shellexecute-on-windows: `that_detached` opens through ShellExecuteExW, not
+# `cmd /c start`, which would act on `"`, `&` and `%` in what it opens.
+# Only `open_external` may call it (clippy.toml).
+open = { version = "5", features = ["shellexecute-on-windows"] }
+url = "2"
 rand = "0.8"
 parking_lot = "0.12"
 # Used by the Gemini bridge to resolve the `gemini` binary explicitly on
@@ -43,9 +47,12 @@ glob = "0.3"
 # Antigravity SDK bridge reads `GEMINI_API_KEY` from the OS keyring under
 # `Fleetify-Provider-antigravity-sdk` — same store the Tauri shell writes
 # to via providers_link, so a single source of truth flows through.
-# `windows-native` keeps the credential in the Windows Credential Manager
-# (Tauri shell uses the same feature set).
-keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+# One feature set for every crate (src-tauri, fleet-wipe): Keychain on macOS,
+# Credential Manager on Windows, Secret Service on Linux. Plain `linux-native`
+# (the kernel keyring) is in-memory and loses every credential on reboot. The
+# Secret Service store needs libdbus-1-dev + pkg-config to build on Linux;
+# `crypto-rust` encrypts secrets on the D-Bus wire.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 # Loads `.env` (workspace root) into the process environment at server
 # startup so single-source dev config (POSTHOG_API_KEY, POSTHOG_HOST, …)
 # works without a wrapper shell script. No-op when `.env` is absent —
@@ -57,6 +64,11 @@ dotenvy = "0.15"
 # stdout/stderr pipes — the only way to capture it AND feed the pasted
 # code back is to give agy a real terminal that we own.
 portable-pty = "0.8"
+
+# open_external decides WSL the way the open crate does before it tries
+# wslview (open 5.3.5 unix.rs): the same crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+is-wsl = "0.4"
 
 # Windows-only: read the user's canonical (Machine + User) registry PATH so
 # spawned CLI agents get the clean PATH a fresh terminal would have — NOT the
@@ -76,4 +88,6 @@ rand = "0.8"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
+# Captures log lines in tests that pin what is never logged.
+tracing-subscriber.workspace = true
 wiremock = "0.6"

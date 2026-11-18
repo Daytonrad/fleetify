@@ -7,7 +7,7 @@ import {
   Sparkles, Undo2, Wand2, MoreHorizontal,
   Plug, RefreshCw, ArrowUp, SquareMousePointer,
 } from "lucide-react";
-import { folderName } from "@/lib/utils";
+import { folderName, getPlatform } from "@/lib/utils";
 import { formatShortcut } from "@/lib/keyboard-shortcuts";
 import { humanizeToolName } from "@/lib/tool-names";
 import { searchProjectFiles, apiFetch, type FileSearchEntry, updateSession as apiUpdateSession, enhancePrompt } from "@/lib/api";
@@ -28,7 +28,8 @@ import { ProviderLogo } from "@/components/ui/provider-logo";
 import { RoutingChip } from "@/components/settings/routers/routing-chip";
 import { commandsForContext, type SlashCmdDef } from "@/lib/slash-commands";
 import { useProvidersConfig } from "@/hooks/use-providers-config";
-import { useEscapeToStop, isOnScreen } from "@/hooks/use-escape-to-stop";
+import { isOnScreen, claimEscape, cardShortcut, cardShortcutOwnedElsewhere } from "@/hooks/use-escape-to-stop";
+import { paneOwnsInput } from "./pane-session-context";
 import { UnifiedModelPicker, type Effort as UMEffort } from "./unified-model-picker";
 import { buildPickerGroups, effortForDiscoveredModel, resolveDispatchTool, resolveModelChip, type PickerModel } from "@/lib/picker-groups";
 import { permissionCapabilityFor, permissionModesFor, defaultPermissionMode, isLoudMode, toolMatrixFor, parseToolOverrides, sandboxOptionsFor } from "@/lib/capabilities";
@@ -588,7 +589,14 @@ function MoreActionsMenu({
     const onDoc = (e: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Claim the key so closing the menu does nothing else: no stop, no
+      // back to Fleet, no permission deny. This document listener runs
+      // before those window ones.
+      claimEscape(e);
+      setOpen(false);
+    };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);
     return () => {
@@ -977,6 +985,11 @@ interface ChatInputProps {
   tool?: string | null;
   /** Session ID — used to scope plugin slash commands. Optional (no plugin commands when absent). */
   sessionId?: string | null;
+  /** The split-view pane this composer is in; undefined in the single view.
+   *  Its permission shortcuts, and the broadcast `fleet:focus-input` /
+   *  `fleet:add-element-ref` events, act only in the pane that owns input
+   *  (`paneOwnsInput`). */
+  paneIdx?: number;
   /** Fleet auto mode toggle — when provided, shows the Auto button in the toolbar */
   autoMode?: boolean;
   onToggleAutoMode?: () => void;
@@ -1087,6 +1100,18 @@ export function ModelChip({
   );
 }
 
+/** Whether this composer takes a broadcast composer event (`fleet:focus-input`,
+ *  `fleet:add-element-ref`). Every mounted composer hears it, one per pane in
+ *  a split view, but only one may act. An event that names a session goes to
+ *  that session's composer. One that names none goes to the pane that owns
+ *  input: the focused pane, or the single view's composer. A named event
+ *  whose session has no mounted composer is dropped; it never falls back to
+ *  the focused pane, which is a different chat. */
+function takesComposerEvent(target: unknown, sessionId: string | null | undefined, paneIdx: number | undefined): boolean {
+  if (typeof target === "string") return target === sessionId;
+  return paneOwnsInput(paneIdx, useAppStore.getState().focusedPaneIdx);
+}
+
 /* ─────────────────── main component ─────────────────── */
 
 export function ChatInput({
@@ -1098,7 +1123,7 @@ export function ChatInput({
   contextUsedTokens,
   contextMaxTokens,
   sessionUsage: _sessionUsage,
-  projectPath, worktreePath, tool, sessionId,
+  projectPath, worktreePath, tool, sessionId, paneIdx,
   autoMode: _autoMode, onToggleAutoMode: _onToggleAutoMode,
   agentMentions,
   slotAbove,
@@ -1147,27 +1172,34 @@ export function ChatInput({
   const permVerb = permissionRequest
     ? (permissionRequest.tool_description ?? PERM_VERB[permTool] ?? humanizeToolName(permTool).toLowerCase())
     : "";
-  // Keyboard: Esc → deny, ⌘↵ → allow, ⌘⇧↵ → always allow. Active-session
-  // guarded so a dialog on agent A isn't actioned while viewing agent B, and
-  // on-screen guarded so closing Settings / Library with Esc doesn't deny a
-  // request on the chat parked underneath.
+  // Keyboard: Esc → deny, Mod+Enter → allow, Mod+Shift+Enter → always
+  // allow, with Mod as the labels show it: ⌘ on macOS, Ctrl elsewhere
+  // (`cardShortcut`). Pane guarded: a split view shows every pane's card at
+  // once, so only the pane that owns input answers (the focused pane, the
+  // same rule as Escape-to-stop). On-screen guarded so closing Settings /
+  // Library with Esc doesn't deny a request on the chat parked underneath.
+  // A key that belongs elsewhere answers nothing
+  // (`cardShortcutOwnedElsewhere`): one a popover or modal claimed to close
+  // itself, one typed in a field outside this chat, any key while a modal is
+  // open, and a Mod+Enter typed in any field or already acted on.
   useEffect(() => {
     if (!permissionRequest) return;
+    const platform = getPlatform();
     const handler = (e: KeyboardEvent) => {
+      // Other keys return first, so typing never pays for the style walk.
+      const shortcut = cardShortcut(e, platform);
+      if (!shortcut) return;
+      if (cardShortcutOwnedElsewhere(e, shortcut, wrapperRef.current)) return;
+      if (!paneOwnsInput(paneIdx, useAppStore.getState().focusedPaneIdx)) return;
       if (!isOnScreen(wrapperRef.current)) return;
-      const active = useAppStore.getState().activeSessionId;
-      if (active && sessionId && active !== sessionId) return;
-      if (e.key === "Escape") {
-        e.preventDefault(); onPermissionDeny?.(permissionRequest.id, permissionRequest.tool_name);
-      } else if (e.key === "Enter" && e.metaKey && e.shiftKey) {
-        e.preventDefault(); onPermissionAllowAlways?.(permissionRequest.id, permissionRequest.tool_name);
-      } else if (e.key === "Enter" && e.metaKey) {
-        e.preventDefault(); onPermissionAllow?.(permissionRequest.id, permissionRequest.tool_name);
-      }
+      e.preventDefault();
+      if (shortcut === "deny") onPermissionDeny?.(permissionRequest.id, permissionRequest.tool_name);
+      else if (shortcut === "allowAlways") onPermissionAllowAlways?.(permissionRequest.id, permissionRequest.tool_name);
+      else onPermissionAllow?.(permissionRequest.id, permissionRequest.tool_name);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [permissionRequest, sessionId, onPermissionAllow, onPermissionAllowAlways, onPermissionDeny]);
+  }, [permissionRequest, paneIdx, onPermissionAllow, onPermissionAllowAlways, onPermissionDeny]);
   const askAnyPicked = askActive && (askQuestion?.questions ?? []).some((_, i) => (askSelected[i] ?? []).length > 0);
   const toggleAskOption = useCallback((qIdx: number, label: string, multi: boolean) => {
     setAskSelected(prev => {
@@ -1306,9 +1338,10 @@ export function ChatInput({
   const autoSendRef = useRef<(text: string) => string | null>(() => "composer not ready");
   useEffect(() => {
     const handler = (e: Event) => {
-      const d = (e as CustomEvent<Omit<ElementRef, "id"> & { prompt?: string; autosend?: boolean }>).detail;
+      const d = (e as CustomEvent<Omit<ElementRef, "id"> & { prompt?: string; autosend?: boolean; sessionId?: string | null }>).detail;
       if (!d) return;
-      const { prompt: promptRaw, autosend, ...fields } = d;
+      const { prompt: promptRaw, autosend, sessionId: target, ...fields } = d;
+      if (!takesComposerEvent(target, sessionId, paneIdx)) return;
       const typed = (promptRaw || "").trim();
       // Sync the ref by hand so an immediate dispatch below sees the new chip
       // without waiting for React to flush state.
@@ -1337,7 +1370,7 @@ export function ChatInput({
     };
     window.addEventListener("fleet:add-element-ref", handler);
     return () => window.removeEventListener("fleet:add-element-ref", handler);
-  }, []);
+  }, [sessionId, paneIdx]);
 
   // Names the user has actually picked from a @mention popover this
   // session. Used by buildMentionHtml to decide whether a token earns
@@ -1445,8 +1478,8 @@ export function ChatInput({
     else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
   }, [slashIndex, slashOpen, slashQuery]);
 
-  /* ESC → stop streaming */
-  useEscapeToStop(wrapperRef, !!streaming, onStop);
+  // Escape → stop streaming is registered once, by ChatView, on the surface
+  // that contains this composer (usePaneEscapeToStop).
 
   /* auto-resize textarea */
   const adjust = useCallback(() => {
@@ -2313,11 +2346,15 @@ export function ChatInput({
   // event with the question text. We pre-fill the textarea with it
   // so the user can edit / append before sending. Same channel the
   // EmptyFleetWelcome cards use to deep-link into the input.
+  // One composer takes it (takesComposerEvent): every pane's composer
+  // listens, and each one that took it would focus itself and so move the
+  // focused pane to whichever focused last.
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ text?: string }>).detail;
+      const detail = (e as CustomEvent<{ text?: string; sessionId?: string | null }>).detail;
       const text = detail?.text;
       if (typeof text !== "string") return;
+      if (!takesComposerEvent(detail.sessionId, sessionId, paneIdx)) return;
       setValue(prev => prev ? `${prev}\n${text}` : text);
       requestAnimationFrame(() => {
         if (ref.current) {
@@ -2329,7 +2366,7 @@ export function ChatInput({
     };
     window.addEventListener("fleet:focus-input", handler);
     return () => window.removeEventListener("fleet:focus-input", handler);
-  }, []);
+  }, [sessionId, paneIdx]);
 
   /** Wand button handler — routes through the SAME WS bridge the
    *  chat itself uses, so the rewrite is produced by whatever CLI

@@ -5,7 +5,7 @@ import { wsManager } from "@/services/ws-manager";
 import { stopSession, archiveSession } from "@/lib/api";
 import { git } from "@/lib/git-api";
 import { getPlatform, type Platform } from "@/lib/utils";
-import { isOnScreen } from "@/hooks/use-escape-to-stop";
+import { isOnScreen, modalOpen } from "@/hooks/use-escape-to-stop";
 
 /** Resolve the active session's project folder, or null if Fleet view. */
 function activeFolder(): string | null {
@@ -34,6 +34,10 @@ interface ShortcutBinding {
    *  simply ignore the argument. */
   matches: (e: KeyboardEvent, mod: boolean, shift: boolean, platform: Platform) => boolean;
   run: (e: KeyboardEvent, ctx: ShortcutCtx) => void;
+  /** Still runs while App.tsx parks the shell under `display: none` (Settings
+   *  or Library open). Only for a binding that does not act on the hidden UI —
+   *  today just the emergency abort-all. */
+  worksWhileParked?: boolean;
 }
 
 /**
@@ -58,9 +62,10 @@ export const SHORTCUT_BINDINGS: ShortcutBinding[] = [
     },
   },
   {
-    // Cmd+Shift+S — toggle sidebar
+    // Cmd+Shift+S — toggle sidebar. Case-insensitive like the other letter
+    // bindings: Caps Lock, or Cmd+Shift on macOS, can deliver "s".
     id: "toggle-sidebar",
-    matches: (e, mod, shift) => mod && shift && e.key === "S",
+    matches: (e, mod, shift) => mod && shift && e.key.toLowerCase() === "s",
     run: (e, { state }) => { e.preventDefault(); state.toggleSidebar(); },
   },
   {
@@ -111,9 +116,19 @@ export const SHORTCUT_BINDINGS: ShortcutBinding[] = [
     },
   },
   {
-    // Cmd+Shift+. — toggle right panel
+    // Cmd+Shift+. — toggle right panel. `key` includes Shift, so the chord
+    // reports ">" on US-style layouts and Dvorak, "." on AZERTY (Shift+;) and
+    // on macOS when Cmd hides Shift, and ":" where Shift+. is ":" — on the
+    // Period key (German, Nordic, Spanish, Italian, Swiss, Czech, Hungarian,
+    // Turkish F) or the Slash key (Turkish Q, Latvian modern; Brazilian
+    // ABNT2's ;: key sends the same event, and nothing else binds it).
+    // Nothing looser: on the Period key, AZERTY's Ctrl+/ reports "/" (the
+    // Files editor's toggle-comment) and Dvorak's Ctrl+Shift+V reports "V"
+    // (paste). Russian-style layouts, where Shift+. is ",", still miss it.
     id: "toggle-right-panel",
-    matches: (e, mod, shift) => mod && shift && e.key === ".",
+    matches: (e, mod, shift) =>
+      mod && shift &&
+      (e.key === "." || e.key === ">" || (e.key === ":" && (e.code === "Period" || e.code === "Slash"))),
     run: (e, { state }) => { e.preventDefault(); state.toggleRightPanel(); },
   },
   {
@@ -192,29 +207,48 @@ export const SHORTCUT_BINDINGS: ShortcutBinding[] = [
     },
   },
   {
-    // Cmd+Shift+A — abort all running agents
+    // Cmd+Shift+A — abort all running agents. An emergency stop, so it also
+    // works while Settings or Library hides the shell, and it ignores case:
+    // Caps Lock, or Cmd+Shift on macOS, can deliver "a".
     id: "abort-all",
-    matches: (e, mod, shift) => mod && shift && e.key === "A",
-    run: (e, { state }) => {
+    worksWhileParked: true,
+    matches: (e, mod, shift) => mod && shift && e.key.toLowerCase() === "a",
+    run: (e, { state, chatState }) => {
       e.preventDefault();
-      const running = state.sessions.filter(
-        s =>
-          (s.status === "running" || s.status === "waiting" || s.status === "starting") &&
-          s.id !== state.staffSessionId,
-      );
-      for (const s of running) {
-        wsManager.abort(s.id).catch(() => {});
-        stopSession(s.id).catch(() => {});
+      // Every live agent: app-store status running / waiting / starting, plus
+      // any chat still streaming, which the Fleet panel also shows as running.
+      // A Set, so an agent that is both is stopped once.
+      const ids = new Set<string>();
+      for (const s of state.sessions) {
+        if (s.status === "running" || s.status === "waiting" || s.status === "starting") ids.add(s.id);
+      }
+      for (const [id, chat] of Object.entries(chatState.sessions)) {
+        if (chat.isStreaming) ids.add(id);
+      }
+      if (state.staffSessionId) ids.delete(state.staffSessionId);
+      for (const id of ids) {
+        wsManager.abort(id).catch(() => {});
+        stopSession(id).catch(() => {});
       }
     },
   },
   {
     // Escape — go back to Fleet if in an agent view and not streaming. Skips
     // when focus is in an editable / dialog / keep-focus element (those own
-    // their Esc), so it never destroys a draft mid-compose.
+    // their Esc), so it never destroys a draft mid-compose. Also skips an
+    // Escape that a popover or menu already claimed to close itself, and any
+    // Escape while a modal is open.
     id: "back-to-fleet",
     matches: (e, mod, shift) => e.key === "Escape" && !mod && !shift,
     run: (e, { state, chatState }) => {
+      // An Escape another handler already acted on is not ours. Mostly that
+      // is a popover or menu claiming the Escape that closes it
+      // (`claimEscape`) from a document listener or a React handler, both of
+      // which run before this window listener. This one registers once, at
+      // shell mount, so the chat's own window listeners (stop, permission
+      // card) normally come after it. If one ever ran first, it acted on
+      // this Escape too.
+      if (e.defaultPrevented) return;
       const target = e.target as HTMLElement | null;
       const inEditable =
         !!target && (
@@ -225,9 +259,20 @@ export const SHORTCUT_BINDINGS: ShortcutBinding[] = [
           !!target.closest("[data-keep-focus='true']")
         );
       if (inEditable) return;
-      const { activeSessionId, staffSessionId } = state;
-      if (activeSessionId && activeSessionId !== staffSessionId) {
-        const cs = chatState.sessions[activeSessionId];
+      // Every key is the modal's while one is open, also when focus is
+      // outside it and the modal's own listener hasn't run yet.
+      if (modalOpen()) return;
+      // The session this Escape would stop. In a split view that is the
+      // focused pane's (the one Escape-to-stop serves); activeSessionId can
+      // name another session, e.g. the pane just closed. If that one is idle
+      // while the focused pane streams, acting here (preventDefault) would
+      // make the stop skip.
+      const { activeSessionId, staffSessionId, splitPaneIds, focusedPaneIdx } = state;
+      const sessionId = splitPaneIds.length > 1
+        ? splitPaneIds[Math.min(focusedPaneIdx, splitPaneIds.length - 1)] ?? null
+        : activeSessionId;
+      if (sessionId && sessionId !== staffSessionId) {
+        const cs = chatState.sessions[sessionId];
         if (!(cs?.isStreaming)) {
           e.preventDefault();
           state.setActiveSession(null);
@@ -245,25 +290,28 @@ export const HANDLED_SHORTCUT_IDS: string[] = SHORTCUT_BINDINGS.map(b => b.id);
  * from the stores inside the handler. First matching binding wins.
  *
  * `shell` is the AppShell root. App.tsx parks the shell under `display: none`
- * while Settings or Library is open, and every binding here acts on that
- * hidden UI — so a parked shell ignores the keyboard entirely. Without this,
- * the Escape that closed Library also ran `back-to-fleet` underneath it.
+ * while Settings or Library is open, and nearly every binding here acts on
+ * that hidden UI — so a parked shell ignores them. Without this, the Escape
+ * that closed Library also ran `back-to-fleet` underneath it. Only a binding
+ * marked `worksWhileParked` (the emergency abort-all) still runs.
  */
 export function useKeyboardShortcuts(shell?: RefObject<Element | null>) {
   useEffect(() => {
     // Host platform is stable for the session — resolve once, not per keystroke.
     const platform = getPlatform();
     const handler = (e: KeyboardEvent) => {
-      if (shell && !isOnScreen(shell.current)) return;
       const mod = e.metaKey || e.ctrlKey;
       const shift = e.shiftKey;
-      const ctx: ShortcutCtx = {
+      // Match first: most keystrokes are plain typing that no binding handles,
+      // and they must not pay for the computed-style walk in isOnScreen.
+      const binding = SHORTCUT_BINDINGS.find(b => b.matches(e, mod, shift, platform));
+      if (!binding) return;
+      // The flag goes first so abort-all skips that walk too.
+      if (shell && !binding.worksWhileParked && !isOnScreen(shell.current)) return;
+      binding.run(e, {
         state: useAppStore.getState(),
         chatState: useChatStore.getState(),
-      };
-      for (const b of SHORTCUT_BINDINGS) {
-        if (b.matches(e, mod, shift, platform)) { b.run(e, ctx); return; }
-      }
+      });
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

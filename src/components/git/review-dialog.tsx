@@ -13,8 +13,10 @@
  * to the Diff Viewer (future work).
  */
 import { useEffect, useState } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { markdownLinkComponents } from "@/components/markdown-link";
 import { Loader2, RefreshCw, X, ScanEye, Copy, Check } from "lucide-react";
 import { git } from "@/lib/git-api";
 import { glog } from "@/lib/git-log";
@@ -91,8 +93,10 @@ export function ReviewDialog({
   };
 
   // ESC closes the dialog. Matches the Create PR dialog's affordance.
+  // Claiming the key means the chat underneath neither stops its stream nor
+  // answers a pending permission card with it.
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") { claimEscape(e); onClose(); } };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [onClose]);
@@ -120,6 +124,7 @@ export function ReviewDialog({
       <div
         onClick={e => e.stopPropagation()}
         role="dialog"
+        aria-modal="true"
         aria-label="Code review"
         style={{
           width: "min(720px, 92vw)",
@@ -202,7 +207,7 @@ export function ReviewDialog({
           )}
           {phase === "ready" && (
             <div className="review-md" style={{ fontFamily: "inherit" }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{review}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownLinkComponents}>{review}</ReactMarkdown>
             </div>
           )}
         </div>

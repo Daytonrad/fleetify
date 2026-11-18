@@ -25,6 +25,7 @@
  *     the existing per-session worktree creation on PATCH).
  */
 import { useState, useEffect, useRef, useCallback } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import {
   FolderOpen, Monitor, History, Plus, Check, ChevronDown,
   GitBranch, Search as SearchIcon,
@@ -295,7 +296,12 @@ export function SessionToolbar({
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpenMenu(null);
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      setOpenMenu(null);
     };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);

@@ -15,6 +15,7 @@
  */
 
 import { useEffect, useRef, useState, useMemo } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { Plus, GitBranch, Check, GitPullRequest, Loader2, GitMerge } from "lucide-react";
 import { pushChatError } from "@/stores/chat-store";
 import { useAppStore, COMPOSER_CHAT_KEY } from "@/stores/app-store";
@@ -118,6 +119,10 @@ export function BranchPickerMenu({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
       if (newBaseDraft !== null) {
         setNewBaseDraft(null);
         setError(null);

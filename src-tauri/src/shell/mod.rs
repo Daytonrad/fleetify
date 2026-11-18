@@ -4,6 +4,7 @@
 
 pub mod ai_git;
 pub mod auth;
+pub mod backend_ready;
 pub mod bearer;
 pub mod config;
 pub mod feedback;
@@ -21,4 +22,6 @@ pub mod providers_setup;
 pub mod pty;
 pub mod routers_link;
 pub mod routing_setup;
+pub mod startup_window;
+pub mod ui_files;
 pub mod voice;

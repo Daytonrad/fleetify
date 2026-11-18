@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, useState, useMemo, memo } from "react";
+import { useEffect, useRef, useCallback, useState, useMemo, memo, type RefObject } from "react";
 import Lenis from "lenis";
 import { useAppStore, COMPOSER_CHAT_KEY } from "@/stores/app-store";
 import { useChatStore, selectSession, typeOutAssistantMessage, pushChatError } from "@/stores/chat-store";
@@ -8,15 +8,17 @@ import { MessageContent, StreamingMessage } from "./message-content";
 import { CompactionPill } from "./compaction-pill";
 import { ContainerSetupPill } from "./container-setup-pill";
 import { PermissionDialog } from "./permission-dialog";
+import { paneOwnsInput } from "./pane-session-context";
 import { CursorQuestionCard } from "./cursor-question-card";
 import { CursorPlanCard } from "./cursor-plan-card";
 import { SessionToolbar } from "./session-toolbar";
 import { fetchMessages, fetchClaudeHistory, createSession, clearSessionMessages, updateSession as apiUpdateSession, stopSession, restartSession, analyzeFleetResponse, fetchAgentModels, planFleet, delegateFleet, type PlanDispatch } from "@/lib/api";
+import { parseStoredMessage } from "@/lib/session-messages";
 import { registerConfigPatch } from "@/lib/session-config-sync";
 import { usesInAppTitleBar, folderName } from "@/lib/utils";
 import { formatShortcut } from "@/lib/keyboard-shortcuts";
 import { useProvidersConfig } from "@/hooks/use-providers-config";
-import { useEscapeToStop } from "@/hooks/use-escape-to-stop";
+import { useEscapeToStop, claimEscape } from "@/hooks/use-escape-to-stop";
 import { resolveStartupDefault, hermesHealModel, HERMES_DEFAULT_SENTINEL, contextWindowForModel, buildPickerGroups, resolveDispatchTool } from "@/lib/picker-groups";
 import { providers } from "@/lib/providers-api";
 import { useDiscoveredModelsStore } from "@/stores/discovered-models-store";
@@ -158,6 +160,27 @@ const MessageList = memo(function MessageList({
     </>
   );
 });
+
+/** Escape aborts this chat's stream. Each chat view registers once.
+ *
+ *  A split view mounts one ChatView per pane, and every pane is on screen, so
+ *  only the focused pane may own the key (`paneOwnsInput`, which also says why
+ *  it keys on `focusedPaneIdx` and not `activeSessionId`). Window listeners
+ *  fire in the order they were registered, which is the order the streams
+ *  started. Without this gate, Escape stopped the pane that started streaming
+ *  first, not the one the user was in.
+ *
+ *  The single (non-split) view has no `paneIdx`, so it always owns Escape.
+ *  The permission cards follow the same rule: ChatView hands them `paneIdx`. */
+export function usePaneEscapeToStop(
+  surface: RefObject<Element | null>,
+  paneIdx: number | undefined,
+  streaming: boolean,
+  onStop: () => void,
+): void {
+  const ownsEscape = useAppStore((s) => paneOwnsInput(paneIdx, s.focusedPaneIdx));
+  useEscapeToStop(surface, streaming && ownsEscape, onStop);
+}
 
 export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
   /** When set, this ChatView instance is rendering inside a split-
@@ -427,21 +450,11 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
 
 
   const [chatCtxMenu, setChatCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
-  const chatCtxMenuRef = useRef<HTMLDivElement>(null);
+  // Stable, so the open menu's dismiss listeners are not re-added on every
+  // streaming-token render of this view.
+  const closeChatCtxMenu = useCallback(() => setChatCtxMenu(null), []);
 
   useEffect(() => { staffIdRef.current = staffSessionId; }, [staffSessionId]);
-
-  useEffect(() => {
-    if (!chatCtxMenu) return;
-    const onDown = (e: MouseEvent) => {
-      if (chatCtxMenuRef.current && !chatCtxMenuRef.current.contains(e.target as Node))
-        setChatCtxMenu(null);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setChatCtxMenu(null); };
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
-  }, [chatCtxMenu]);
 
   // ── Prune the per-session ref Sets when sessions go away ──
   // Without this, autoIntroFiredRef / autoIntroTitleParsedRef /
@@ -762,15 +775,7 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
   }, [effectiveSessionId]);
 
   // Shared message parser — lifted so both effects below can use it
-  const parseContent = useCallback((m: { content: string | ContentBlock[]; [k: string]: unknown }) => {
-    let content: ContentBlock[];
-    try {
-      content = typeof m.content === "string" ? JSON.parse(m.content as string) : (m.content as ContentBlock[]);
-    } catch {
-      content = [{ type: "text" as const, text: typeof m.content === "string" ? m.content : "" }];
-    }
-    return { ...m, content } as ChatMessage;
-  }, []);
+  const parseContent = parseStoredMessage;
 
   // Load message history every time the user opens a session.
   //
@@ -967,9 +972,9 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
     if (effectiveSessionId) wsManager.abort(effectiveSessionId);
   }, [effectiveSessionId]);
 
-  // Global ESC to abort streaming
+  // Global ESC to abort streaming. In a split view, only the focused pane's.
   const surfaceRef = useRef<HTMLDivElement>(null);
-  useEscapeToStop(surfaceRef, isStreaming, handleStop);
+  usePaneEscapeToStop(surfaceRef, paneIdx, isStreaming, handleStop);
 
   const handleModelChange = useCallback((sessionId: string, modelId: string) => {
     updateSession(sessionId, { model_name: modelId });
@@ -2099,7 +2104,9 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
   }, [isControlCenter, agentSessions.map(s => s.id).join(","), ensureSession, setMessages, parseContent]);
 
   return (
-    <div ref={surfaceRef} style={{
+    // data-chat-surface marks this chat's extent for the permission cards: a
+    // key typed in a field outside it isn't theirs (cardKeyOwnedElsewhere).
+    <div ref={surfaceRef} data-chat-surface="" style={{
       flex: 1, display: "flex", background: "var(--card)", overflow: "hidden", position: "relative",
       // Transcript font scale — exposed as a CSS variable so any
       // descendant that opts in (`font-size: calc(13px * var(--chat-font-scale))`)
@@ -2495,6 +2502,10 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
           askQuestion={askQuestion}
           onAnswerQuestion={effectiveSessionId ? (id, answers) => wsManager.sendAskQuestionResponse(effectiveSessionId, id, true, answers) : undefined}
           onSkipQuestion={effectiveSessionId ? (id) => wsManager.sendAskQuestionResponse(effectiveSessionId, id, false, []) : undefined}
+          // Which pane this composer is in (undefined in the single view):
+          // its permission keys and the broadcast composer events follow
+          // the pane that owns input.
+          paneIdx={paneIdx}
           permissionRequest={permissionRequest && permissionRequest.tool_name !== "AskUserQuestion" ? permissionRequest : null}
           onPermissionAllow={effectiveSessionId ? (id, toolName) => wsManager.sendPermissionResponse(effectiveSessionId, id, true, false, toolName) : undefined}
           onPermissionAllowAlways={effectiveSessionId ? (id, toolName) => wsManager.sendPermissionResponse(effectiveSessionId, id, true, true, toolName) : undefined}
@@ -2672,7 +2683,7 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
               {permissionRequest && permissionRequest.tool_name === "AskUserQuestion" && effectiveSessionId ? (
                 <PermissionDialog
                   request={permissionRequest}
-                  sessionId={effectiveSessionId}
+                  paneIdx={paneIdx}
                   onAllow={(id, toolName) => wsManager.sendPermissionResponse(effectiveSessionId, id, true, false, toolName)}
                   onAllowAlways={(id, toolName) => wsManager.sendPermissionResponse(effectiveSessionId, id, true, true, toolName)}
                   onDeny={(id, toolName) => wsManager.sendPermissionResponse(effectiveSessionId, id, false, false, toolName)}
@@ -2700,18 +2711,9 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
                   Self-gated: returns null when the session is in
                   manual mode or has no pending decision. */}
               {!isControlCenter && effectiveSessionId && (
-                <FleetDecisionCard
+                <ChatDecisionCard
                   sessionId={effectiveSessionId}
                   onSend={(text) => handleAgentSend(text)}
-                  onAnswer={(question) => {
-                    // Pre-fill the user's input with the question
-                    // verbatim so they can edit or append before
-                    // sending. Fires through the same custom event
-                    // the @-mention picker uses to nudge the input.
-                    window.dispatchEvent(new CustomEvent("fleet:focus-input", {
-                      detail: { text: question },
-                    }));
-                  }}
                 />
               )}
               {/* Home delegation — the composer as a "delegate a goal" input.
@@ -2898,24 +2900,72 @@ export function ChatView({ paneSessionId, paneIdx, onClosePane }: {
       </div>
       {chatCtxMenu && (
         <ChatContextMenu
-          menuRef={chatCtxMenuRef}
           x={chatCtxMenu.x}
           y={chatCtxMenu.y}
           text={chatCtxMenu.text}
-          onClose={() => setChatCtxMenu(null)}
+          sessionId={effectiveSessionId}
+          onClose={closeChatCtxMenu}
         />
       )}
     </div>
   );
 }
 
-function ChatContextMenu({ menuRef, x, y, text, onClose }: {
-  menuRef: React.RefObject<HTMLDivElement | null>;
+/** The Fleet decision card in a chat's composer slot. Exported for tests. */
+export function ChatDecisionCard({ sessionId, onSend }: {
+  sessionId: string;
+  onSend: (text: string) => void;
+}) {
+  return (
+    <FleetDecisionCard
+      sessionId={sessionId}
+      onSend={onSend}
+      onAnswer={(question) => {
+        // Pre-fill the user's input with the question verbatim so they can
+        // edit or append before sending. Fires through the same custom event
+        // the @-mention picker uses to nudge the input. Names this chat's
+        // session so the text lands in this pane's composer even if the pane
+        // isn't focused yet (see ChatContextMenu's sessionId).
+        window.dispatchEvent(new CustomEvent("fleet:focus-input", {
+          detail: { text: question, sessionId },
+        }));
+      }}
+    />
+  );
+}
+
+/** Right-click menu on a transcript selection. Exported for tests. */
+export function ChatContextMenu({ x, y, text, sessionId, onClose }: {
   x: number; y: number; text: string;
+  /** The chat this transcript belongs to. Its prompts go to that chat's
+   *  composer. In a split view this pane may not be the focused one yet: a
+   *  click reaches the pane's click-to-focus handler only after the item has
+   *  sent its prompt, and WebKit doesn't focus a clicked button. */
+  sessionId?: string | null;
   onClose: () => void;
 }) {
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Dismiss on a click outside the menu, or on Escape.
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      onClose();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [onClose]);
+
   const dispatch = (prompt: string) => {
-    window.dispatchEvent(new CustomEvent("fleet:focus-input", { detail: { text: prompt } }));
+    window.dispatchEvent(new CustomEvent("fleet:focus-input", { detail: { text: prompt, sessionId } }));
     onClose();
   };
 
@@ -2988,8 +3038,8 @@ function ChatContextMenu({ menuRef, x, y, text, onClose }: {
    read as `lalala / lalala` once the session title was derived from
    the same basename. Showing the full path makes the two halves
    carry distinct information again. Long paths middle-truncate to
-   keep the header from blowing out. */
-function SessionBreadcrumb({
+   keep the header from blowing out. Exported for tests. */
+export function SessionBreadcrumb({
   projectPath,
   worktreePath,
   title,
@@ -3156,7 +3206,9 @@ function SessionBreadcrumb({
           onChange={e => setDraft(e.target.value)}
           onKeyDown={e => {
             if (e.key === "Enter") { e.preventDefault(); commit(); }
-            else if (e.key === "Escape") { e.preventDefault(); setEditing(false); }
+            // Claim it: cancelling the rename must not also deny a pending
+            // permission card.
+            else if (e.key === "Escape") { claimEscape(e.nativeEvent); setEditing(false); }
           }}
           onBlur={commit}
           spellCheck={false}
@@ -3246,7 +3298,8 @@ const PANEL_VIEWS: {
   // it look like an idle workspace pane, which it isn't.
 ];
 
-function PanelViewMenu({
+/** Exported for tests. */
+export function PanelViewMenu({
   open, activeViews, onSelectView, onRemoveView,
 }: {
   open: boolean;
@@ -3271,7 +3324,14 @@ function PanelViewMenu({
     const click = (e: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setMenuOpen(false);
     };
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setMenuOpen(false); };
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      setMenuOpen(false);
+    };
     document.addEventListener("mousedown", click);
     document.addEventListener("keydown", esc);
     return () => { document.removeEventListener("mousedown", click); document.removeEventListener("keydown", esc); };

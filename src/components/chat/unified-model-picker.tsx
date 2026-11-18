@@ -10,6 +10,7 @@
  * `supports_effort` is false. The catalog ships the flag per-entry.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { Check, ChevronDown } from "lucide-react";
 import { ProviderLogo } from "@/components/ui/provider-logo";
 import type { PickerGroup, PickerModel } from "@/lib/picker-groups";
@@ -110,7 +111,12 @@ export function UnifiedModelPicker({
       if (!rootRef.current?.contains(e.target as Node)) onClose();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      // Claim the key so closing this does nothing else: no stop, no back
+      // to Fleet, no permission deny. This document listener runs before
+      // those window ones.
+      claimEscape(e);
+      onClose();
     };
     document.addEventListener("mousedown", onDown, true);
     document.addEventListener("keydown", onKey);

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { claimEscape } from "@/hooks/use-escape-to-stop";
 import {
   Search, ArrowRight, Square, Send,
   Layers, StopCircle, Plus, Zap, GitBranch,
@@ -341,7 +342,8 @@ export function CommandPalette({ open, onClose, onAction }: Props) {
       if (!open) return;
 
       if (e.key === "Escape") {
-        e.preventDefault();
+        // Claim it: closing must not also stop a stream or deny a card.
+        claimEscape(e);
         if (dispatchCmd) { setDispatchCmd(null); setTaskText(""); }
         else onClose();
         return;
@@ -420,8 +422,13 @@ export function CommandPalette({ open, onClose, onAction }: Props) {
         }}
       />
 
-      {/* Modal */}
+      {/* Modal. aria-modal makes Escape-to-stop leave this Escape alone even
+          though this listener runs after the chat's: it re-registers every
+          time the palette opens. */}
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
         style={{
           position: "fixed",
           top: "14vh",

@@ -14,9 +14,6 @@ crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# Read POSTHOG_* keys from `.env` at compile time so the renderer never
-# sees the API key and the literal string doesn't sit in tracked source.
-dotenvy = "0.15"
 
 [dependencies]
 fleetify-core.workspace = true
@@ -35,14 +32,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-# Windows is the current build/dev target; per-OS backends (apple-native /
-# sync-secret-service) get added behind cfg in Phase 5 packaging.
-keyring = { version = "3", features = ["windows-native"] }
+# Same feature set as fleetify-backend (rationale there): the Secret Service
+# store keeps Linux sign-in and provider keys across reboots.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
-open = "5"
 tiny_http = "0.12"
 url = "2"
 arboard = "3"
@@ -90,6 +86,10 @@ x11-dl = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# The vendored runtime (root Cargo.toml's [patch.crates-io]), for the tests of
+# its postMessage IPC patch (vendor/tauri-runtime-wry/FLEETIFY_PATCH.md).
+# No features: tauri enables the ones it needs.
+tauri-runtime-wry = { version = "2", default-features = false }
 
 [features]
 # On-device Whisper ships by DEFAULT so the offline voice engine works out
