@@ -1,0 +1,3 @@
+# Once a pull request is ready for review (drafts get no request), GitHub
+# requests a review from these code owners, except the pull request's author.
+* @dorukozgen @CryonicsX

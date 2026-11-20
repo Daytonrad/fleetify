@@ -143,6 +143,17 @@ jobs:
       - name: Unit tests (advisory)
         continue-on-error: true
         run: npm test
+      # The config tests parse YAML with python3 and PyYAML, and skip those
+      # checks where PyYAML is missing. Fail here instead, so a runner image
+      # without it can't quietly turn the hard gate below into skips.
+      - name: Check PyYAML for the config tests
+        run: python3 -c "import yaml"
+      # The node:test suites of the repo's own scripts: the DCO check, the
+      # GitHub config and the public docs' links and contacts (scripts/ci), and
+      # the release secret scanner (scripts/release). A hard gate, because they
+      # are deterministic and fast.
+      - name: Script tests
+        run: node --test "scripts/ci/*.test.mjs" "scripts/release/*.test.mjs"
       - name: Audit (advisory)
         continue-on-error: true
         run: npm audit --omit=dev
