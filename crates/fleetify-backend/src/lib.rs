@@ -4,7 +4,9 @@
 //! calls it from its setup hook.
 
 mod http;
+mod log_budget;
 
+pub mod access;
 pub mod agentic;
 pub mod auth;
 pub mod bridges;
@@ -19,6 +21,7 @@ pub mod session_manager;
 pub mod studio;
 #[cfg(test)]
 pub mod test_support;
+pub mod ui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -103,20 +106,32 @@ async fn normalize_legacy_verbatim_project_paths(pool: &sqlx::SqlitePool) {
     }
 }
 
-/// Bind `addr` and start serving on a background task. `static_dir` is the
-/// built React asset directory for single-origin serving (`None` = API only).
-///
-/// Convenience wrapper around `serve_with_routing_setup` for callers that
-/// don't have hydrated router credentials (tests, headless dev runs).
-/// External routers stay un-registered — only builtin + DirectGateway are
-/// available, and the master toggle defaults to OFF.
-pub async fn serve(addr: SocketAddr, static_dir: Option<PathBuf>) -> anyhow::Result<ServerHandle> {
-    serve_with_routing_setup(
-        addr,
-        static_dir,
-        services::routing::setup::RoutingSetup::default(),
-    )
-    .await
+/// What [`serve`] starts with.
+pub struct ServeOptions {
+    /// The release UI's files, which the shell embeds in the binary and the
+    /// backend serves on its own origin ([`ui`]). `None` serves the API
+    /// only: a debug build loads its UI from the Vite dev server.
+    pub ui: Option<ui::UiAssets>,
+    /// The external routers to hydrate the routing orchestrator with. The
+    /// Tauri shell composes it from `fleet.config.json` + the per-user
+    /// keychain, so the backend stays Tauri-agnostic.
+    pub routing_setup: services::routing::setup::RoutingSetup,
+    /// This run's API token. The shell gives the same token to the renderer.
+    pub api_token: access::ApiToken,
+}
+
+impl ServeOptions {
+    /// For callers that don't have hydrated router credentials (tests,
+    /// headless dev runs): no UI files, and external routers stay
+    /// un-registered — only builtin + DirectGateway are available, and the
+    /// master toggle defaults to OFF.
+    pub fn api_only(api_token: access::ApiToken) -> Self {
+        Self {
+            ui: None,
+            routing_setup: services::routing::setup::RoutingSetup::default(),
+            api_token,
+        }
+    }
 }
 
 /// Whether this instance should isolate its sessions DB under FLEETIFY_HOME:
@@ -163,15 +178,25 @@ pub(crate) fn should_load_dotenv(release_build: bool) -> bool {
     !release_build
 }
 
-/// Bind `addr` and start serving, hydrating the routing orchestrator with
-/// the supplied `routing_setup`. The Tauri shell composes the setup from
-/// `fleet.config.json` + the per-user keychain before invoking this so
-/// the backend stays Tauri-agnostic.
-pub async fn serve_with_routing_setup(
-    addr: SocketAddr,
-    static_dir: Option<PathBuf>,
-    routing_setup: services::routing::setup::RoutingSetup,
-) -> anyhow::Result<ServerHandle> {
+/// `FLEETIFY_REQUIRE_API_TOKEN=1`: a debug build asks for the API token even
+/// when it runs with `FLEETIFY_NOAUTH=1`. A release build never reads the
+/// variable; it always asks ([`access::token_required`]).
+fn api_token_forced() -> bool {
+    cfg!(debug_assertions) && std::env::var("FLEETIFY_REQUIRE_API_TOKEN").as_deref() == Ok("1")
+}
+
+/// Bind `addr` and start serving on a background task, with the UI files,
+/// external routers and API token in `opts`. The access guard
+/// ([`access::guard`]) answers only requests addressed to the port actually
+/// bound, and asks API requests for the token unless this is a debug build
+/// running with `FLEETIFY_NOAUTH=1` (and without
+/// `FLEETIFY_REQUIRE_API_TOKEN=1`). Both are read once, here.
+pub async fn serve(addr: SocketAddr, opts: ServeOptions) -> anyhow::Result<ServerHandle> {
+    let ServeOptions {
+        ui,
+        routing_setup,
+        api_token,
+    } = opts;
     // Debug builds load the first `.env` found walking up from the working
     // directory (the workspace root's under `npm run dev:tauri`) into the
     // process environment. Existing env vars are NOT overridden — a real
@@ -393,7 +418,23 @@ pub async fn serve_with_routing_setup(
     let bg_pool = state.auth.pool.clone();
     let bg_sm = state.sm;
     let bg_cfg = state.app_cfg.clone();
-    let router = app(state, static_dir);
+    let token_required = access::token_required(
+        !cfg!(debug_assertions),
+        auth::is_no_auth(),
+        api_token_forced(),
+    );
+    tracing::info!(
+        target: "fleet-backend",
+        api_token_required = token_required,
+        "access policy"
+    );
+    let policy = access::AccessPolicy {
+        port: local_addr.port(),
+        token: api_token,
+        token_required,
+        refusal_log: Default::default(),
+    };
+    let router = app(state, ui, policy);
     tokio::spawn(async move {
         let server = axum::serve(listener, router).with_graceful_shutdown(async {
             let _ = shutdown_rx.await;
@@ -580,5 +621,33 @@ mod dotenv_tests {
     fn dotenv_is_read_only_by_debug_builds() {
         assert!(!should_load_dotenv(true));
         assert!(should_load_dotenv(false));
+    }
+}
+
+#[cfg(test)]
+mod api_token_tests {
+    use super::api_token_forced;
+
+    #[test]
+    fn only_require_api_token_1_forces_the_token_and_only_in_debug_builds() {
+        // The variable is process-wide: change it only under the crate's
+        // env lock, and put back whatever was there before asserting.
+        let _g = crate::test_support::home_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("FLEETIFY_REQUIRE_API_TOKEN");
+        std::env::set_var("FLEETIFY_REQUIRE_API_TOKEN", "1");
+        let one = api_token_forced();
+        std::env::set_var("FLEETIFY_REQUIRE_API_TOKEN", "true");
+        let other = api_token_forced();
+        std::env::remove_var("FLEETIFY_REQUIRE_API_TOKEN");
+        let unset = api_token_forced();
+        match prev {
+            Some(v) => std::env::set_var("FLEETIFY_REQUIRE_API_TOKEN", v),
+            None => std::env::remove_var("FLEETIFY_REQUIRE_API_TOKEN"),
+        }
+        assert_eq!(one, cfg!(debug_assertions));
+        assert!(!other);
+        assert!(!unset);
     }
 }

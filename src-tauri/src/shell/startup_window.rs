@@ -13,6 +13,13 @@
 //! the backend can't start at all, or a release build has no UI files to
 //! serve (see `shell::ui_files`), an error dialog says why and the app quits.
 //!
+//! Once the app page has loaded, the window never goes back to the
+//! placeholder ([`guard_main_navigation`]): a back navigation (Alt+Left on
+//! Windows, or `history.back()` past the app's first page) would show
+//! "Starting Fleetify…" for good. The placeholder's body is a drag region, so
+//! the window, which has no title bar to drag it by, can be moved while it
+//! waits.
+//!
 //! It also works out the app's origin ([`app_origin`]) and, when that origin
 //! is remote, the capability that grants it IPC at setup
 //! ([`runtime_remote_origin`], [`runtime_capability`]).
@@ -35,7 +42,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tokio::sync::{watch, Notify};
 
 use crate::shell::backend_ready::{BackendStart, StartFailure};
-use crate::shell::ui_files::UiDirError;
+use crate::shell::ui_files::UiFilesMissing;
 
 /// Label of the main window.
 pub const MAIN_WINDOW: &str = "main";
@@ -74,7 +81,9 @@ const PAINT_GRACE: Duration = Duration::from_millis(120);
 
 /// The page the main window shows until the app loads. It loads nothing:
 /// inline styles only, colours from the system scheme (the app's own light
-/// theme and its default dark theme, from `src/globals.css`).
+/// theme and its default dark theme, from `src/globals.css`). Its body is a
+/// drag region: the preload turns a mousedown in it into
+/// `window_start_dragging`, as in the app's title bar.
 pub const PLACEHOLDER_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -100,15 +109,20 @@ body {
 }
 </style>
 </head>
-<body>
+<body class="drag-region">
 <p>Starting Fleetify…</p>
 </body>
 </html>
 "#;
 
-/// The placeholder's Content-Security-Policy: its inline styles and nothing
-/// else, so the engine itself refuses any resource.
-const PLACEHOLDER_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'";
+/// The placeholder's Content-Security-Policy: its inline styles, and
+/// requests to Tauri's IPC for the drag (`ipc://localhost` on Linux and
+/// macOS, `http://ipc.localhost` on Windows). The engine itself refuses
+/// anything else. Were the IPC refused, Tauri would fall back to its
+/// postMessage channel, which gets no permissions on Linux (see the vendored
+/// runtime's patch).
+const PLACEHOLDER_CSP: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; connect-src ipc: http://ipc.localhost";
 
 /// The placeholder scheme's answer to a request from `webview_label`: the
 /// page for the main window, an empty 404 for any other webview (the
@@ -168,20 +182,71 @@ impl AppLoadGuard {
     }
 }
 
+/// Set once the app page, not the placeholder, has finished loading in the
+/// main window ([`signal_app_page_loaded`]). From then on the window never
+/// goes back to the placeholder ([`guard_main_navigation`]).
+static APP_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Takes one page-load event of the main window, for an app page or not,
+/// through `guard`: true when it finishes a load of the app, as
+/// [`AppLoadGuard`] tells it, and then sets `app_loaded`. The placeholder's
+/// own load never does.
+fn record_page_load(
+    guard: &AppLoadGuard,
+    app_loaded: &AtomicBool,
+    event: PageLoadEvent,
+    app_page: bool,
+) -> bool {
+    let finished = guard.finished_app_load(event, app_page);
+    if finished {
+        app_loaded.store(true, Ordering::SeqCst);
+    }
+    finished
+}
+
 /// A page-load handler for the main window: signals `app_page_loaded` each
 /// time a page of the app at `app_url` finishes loading, as
-/// [`AppLoadGuard`] tells it. A signal sent before anyone waits is kept, so
-/// an early load is never missed.
+/// [`AppLoadGuard`] tells it, and marks the app loaded (`APP_LOADED`). A
+/// signal sent before anyone waits is kept, so an early load is never missed.
 pub fn signal_app_page_loaded(
     app_url: Url,
     app_page_loaded: Arc<Notify>,
 ) -> impl Fn(WebviewWindow, PageLoadPayload<'_>) + Send + Sync + 'static {
     let guard = AppLoadGuard::default();
     move |_window, payload| {
-        if guard.finished_app_load(payload.event(), is_app_page(payload.url(), &app_url)) {
+        let app_page = is_app_page(payload.url(), &app_url);
+        if record_page_load(&guard, &APP_LOADED, payload.event(), app_page) {
             app_page_loaded.notify_one();
         }
     }
+}
+
+/// True when `url` is the placeholder page: any URL on its scheme
+/// ([`PLACEHOLDER_URL`] on Linux and macOS), or the form Windows loads it
+/// in, `http://fleetify-startup.localhost/`, as wry serves a custom scheme
+/// there (`https://` for a window with `useHttpsScheme`). These are the
+/// forms Tauri's `Webview::is_local_url` takes for a custom scheme's pages.
+pub fn is_placeholder_url(url: &Url) -> bool {
+    let windows_form = matches!(url.scheme(), "http" | "https")
+        && url
+            .host_str()
+            .and_then(|host| host.strip_suffix(".localhost"))
+            == Some(PLACEHOLDER_SCHEME);
+    url.scheme() == PLACEHOLDER_SCHEME || windows_form
+}
+
+/// Whether the main window may navigate to `url`: anywhere but the
+/// placeholder once the app has loaded (`app_loaded`). It denies nothing
+/// else: WebKitGTK and WKWebView ask about the main webview's iframes too,
+/// and an allowlist would block the Preview pane's.
+pub fn allow_main_navigation(url: &Url, app_loaded: bool) -> bool {
+    !(app_loaded && is_placeholder_url(url))
+}
+
+/// The main window's navigation handler: [`allow_main_navigation`], with
+/// whether the app has loaded in the window yet (`APP_LOADED`).
+pub fn guard_main_navigation(url: &Url) -> bool {
+    allow_main_navigation(url, APP_LOADED.load(Ordering::SeqCst))
 }
 
 /// The backend's start as the startup task sees it: `reported` is the last
@@ -239,18 +304,18 @@ pub fn backend_failure_message(error: &str, port: u16, logs_dir: Option<&Path>) 
 }
 
 /// The text of that dialog when a release build has no UI files to serve
-/// (`missing`, from `shell::ui_files`): reinstall, where it looked for them,
-/// and where the log files are, as [`backend_failure_message`] says it.
-pub fn ui_files_missing_message(missing: &UiDirError, logs_dir: Option<&Path>) -> String {
-    let looked = match missing {
-        UiDirError::NoIndexHtml(dir) => format!("Fleetify looked for them in {}", dir.display()),
-        UiDirError::NoResourceDir(error) => {
-            format!("Fleetify couldn't find its install folder: {error}")
+/// (`missing`, from `shell::ui_files`): reinstall, what is missing, and
+/// where the log files are, as [`backend_failure_message`] says it.
+pub fn ui_files_missing_message(missing: &UiFilesMissing, logs_dir: Option<&Path>) -> String {
+    let what = match missing {
+        UiFilesMissing::NotEmbedded => "This copy of Fleetify was built without them.",
+        UiFilesMissing::NoIndexHtml => {
+            "The interface files built into this copy of Fleetify have no index.html."
         }
     };
     let logs = logs_line(logs_dir);
     format!(
-        "Fleetify's interface files are missing. Please reinstall Fleetify.\n\n{looked}\n\n{logs}"
+        "Fleetify's interface files are missing. Please reinstall Fleetify.\n\n{what}\n\n{logs}"
     )
 }
 
@@ -486,8 +551,8 @@ fn reveal(window: &WebviewWindow, boot_start: Instant) {
 // treats as the app's own (`devUrl` in dev mode, its custom schemes). The
 // origin the main window loads the app from, when it is remote, gets the same
 // permissions at setup, for that origin alone. No other remote origin can
-// call anything: the main webview has no navigation guard, so a page it ends
-// up on elsewhere must find no IPC.
+// call anything: the main webview's navigation guard only keeps it off the
+// placeholder, so a page it ends up on elsewhere must find no IPC.
 
 /// The permissions `capabilities/default.json` grants: the core ones, and
 /// every app command (the `app-commands` set, `permissions/app-commands.toml`).
@@ -671,12 +736,25 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
-        // The engine itself refuses anything but the inline styles.
+        // The engine itself refuses anything but the inline styles and
+        // Tauri's IPC, which the drag goes through: `ipc://localhost` on
+        // Linux and macOS, `http://ipc.localhost` on Windows.
         assert_eq!(
             response.headers()[header::CONTENT_SECURITY_POLICY],
-            "default-src 'none'; style-src 'unsafe-inline'"
+            "default-src 'none'; style-src 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
         );
         assert_eq!(response.body().as_slice(), PLACEHOLDER_HTML.as_bytes());
+    }
+
+    #[test]
+    fn the_placeholder_can_be_dragged() {
+        // The preload turns a mousedown in a .drag-region into
+        // window_start_dragging, as in the app's title bar: the window has
+        // no decorations, and the placeholder fills it.
+        assert!(
+            PLACEHOLDER_HTML.contains(r#"<body class="drag-region">"#),
+            "the placeholder's body is not a drag region"
+        );
     }
 
     #[test]
@@ -820,9 +898,7 @@ mod tests {
 
     /// The report when a release build has no UI files to serve.
     fn ui_files_missing() -> BackendStart {
-        BackendStart::Failed(StartFailure::UiFilesMissing(UiDirError::NoIndexHtml(
-            "/usr/lib/Fleetify/dist".into(),
-        )))
+        BackendStart::Failed(StartFailure::UiFilesMissing(UiFilesMissing::NoIndexHtml))
     }
 
     #[test]
@@ -911,16 +987,14 @@ mod tests {
     const REINSTALL: &str = "Fleetify's interface files are missing. Please reinstall Fleetify.";
 
     #[test]
-    fn the_missing_ui_files_message_says_to_reinstall_and_names_the_folder_and_the_logs() {
+    fn the_missing_ui_files_message_says_to_reinstall_and_what_is_missing_and_the_logs() {
         let logs = tempfile::tempdir().unwrap();
-        let dist = Path::new("/usr/lib/Fleetify/dist");
-        let message = ui_files_missing_message(
-            &UiDirError::NoIndexHtml(dist.to_path_buf()),
-            Some(logs.path()),
-        );
+        let message = ui_files_missing_message(&UiFilesMissing::NoIndexHtml, Some(logs.path()));
         assert!(message.starts_with(REINSTALL), "{message}");
         assert!(
-            message.contains(&format!("Fleetify looked for them in {}", dist.display())),
+            message.contains(
+                "The interface files built into this copy of Fleetify have no index.html."
+            ),
             "{message}"
         );
         assert!(
@@ -932,17 +1006,14 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_ui_files_message_without_a_resource_folder_or_a_log_folder() {
+    fn the_missing_ui_files_message_for_a_build_without_them_and_no_log_folder() {
         let parent = tempfile::tempdir().unwrap();
         let never_created = parent.path().join("logs");
         for logs_dir in [Some(never_created.as_path()), None] {
-            let message = ui_files_missing_message(
-                &UiDirError::NoResourceDir("unknown path".into()),
-                logs_dir,
-            );
+            let message = ui_files_missing_message(&UiFilesMissing::NotEmbedded, logs_dir);
             assert!(message.starts_with(REINSTALL), "{message}");
             assert!(
-                message.contains("Fleetify couldn't find its install folder: unknown path"),
+                message.contains("This copy of Fleetify was built without them."),
                 "{message}"
             );
             assert!(
@@ -965,7 +1036,7 @@ mod tests {
             ),
             backend_failure_message(error, 8765, Some(logs.path()))
         );
-        let missing = UiDirError::NoIndexHtml("/usr/lib/Fleetify/dist".into());
+        let missing = UiFilesMissing::NoIndexHtml;
         assert_eq!(
             start_failure_message(
                 &StartFailure::UiFilesMissing(missing.clone()),
@@ -1146,6 +1217,116 @@ mod tests {
         assert!(!guard.finished_app_load(PageLoadEvent::Started, true));
         assert!(!guard.finished_app_load(PageLoadEvent::Started, false));
         assert!(!guard.finished_app_load(PageLoadEvent::Finished, true));
+    }
+
+    // ── no way back to the placeholder ──
+
+    /// The placeholder's URL as the engines load it: on its own scheme on
+    /// Linux and macOS, and as wry serves a custom scheme on Windows.
+    const PLACEHOLDER_FORMS: [&str; 2] = [PLACEHOLDER_URL, "http://fleetify-startup.localhost/"];
+
+    #[test]
+    fn the_placeholder_is_recognised_as_each_engine_loads_it() {
+        for placeholder in PLACEHOLDER_FORMS {
+            assert!(is_placeholder_url(&url(placeholder)), "{placeholder}");
+        }
+        // The scheme serves the page at every path. A window with
+        // useHttpsScheme would load the Windows form over https.
+        for placeholder in [
+            "fleetify-startup://localhost/index.html?step=2#top",
+            "http://fleetify-startup.localhost/anything",
+            "https://fleetify-startup.localhost/",
+        ] {
+            assert!(is_placeholder_url(&url(placeholder)), "{placeholder}");
+        }
+    }
+
+    #[test]
+    fn no_other_url_is_the_placeholder() {
+        for other in [
+            "http://127.0.0.1:8765/",
+            "http://localhost:3000/",
+            "http://localhost:5173/",
+            "http://localhost/",
+            "https://example.com/",
+            "about:blank",
+            "about:srcdoc",
+            // Tauri's own schemes, as Linux and macOS load them and as
+            // Windows does.
+            "ipc://localhost/window_start_dragging",
+            "http://ipc.localhost/window_start_dragging",
+            "tauri://localhost/",
+            "http://tauri.localhost/",
+        ] {
+            assert!(!is_placeholder_url(&url(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_window_loads_the_placeholder_before_the_app_has_loaded() {
+        // The window is built on it.
+        for placeholder in PLACEHOLDER_FORMS {
+            assert!(
+                allow_main_navigation(&url(placeholder), false),
+                "{placeholder}"
+            );
+        }
+    }
+
+    #[test]
+    fn once_the_app_has_loaded_the_window_never_goes_back_to_the_placeholder() {
+        for placeholder in PLACEHOLDER_FORMS {
+            assert!(
+                !allow_main_navigation(&url(placeholder), true),
+                "{placeholder}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_denies_nothing_but_the_placeholder() {
+        // WebKitGTK and WKWebView ask about the main webview's iframes too:
+        // the Preview pane loads the user's dev server (Vite on 5173, say).
+        for other in [
+            "http://127.0.0.1:8765/",
+            "http://127.0.0.1:8765/settings?tab=privacy#top",
+            "http://localhost:3000/",
+            "http://localhost:5173/",
+            "about:blank",
+        ] {
+            for app_loaded in [false, true] {
+                assert!(
+                    allow_main_navigation(&url(other), app_loaded),
+                    "{other}, app loaded: {app_loaded}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_apps_load_sets_the_app_loaded_flag_and_the_placeholders_does_not() {
+        let guard = AppLoadGuard::default();
+        let app_loaded = AtomicBool::new(false);
+        // One page-load event, for an app page or not.
+        let record = |event, app_page| record_page_load(&guard, &app_loaded, event, app_page);
+        let loaded = || app_loaded.load(Ordering::SeqCst);
+        // The placeholder's own load.
+        assert!(!record(PageLoadEvent::Started, false));
+        assert!(!record(PageLoadEvent::Finished, false));
+        assert!(!loaded(), "set by the placeholder's load");
+        // A cancelled navigation to the app: WebKitGTK reports a Finished
+        // with the app's URL and no Started.
+        assert!(!record(PageLoadEvent::Finished, true));
+        assert!(!loaded(), "set by a cancelled navigation");
+        // The app's load: set once it has finished.
+        assert!(!record(PageLoadEvent::Started, true));
+        assert!(!loaded(), "set before the app's load finished");
+        assert!(record(PageLoadEvent::Finished, true));
+        assert!(loaded());
+        // And it stays set, whatever loads later.
+        assert!(!record(PageLoadEvent::Started, false));
+        assert!(!record(PageLoadEvent::Finished, false));
+        assert!(loaded());
     }
 
     // ── IPC from the app's origin ──
@@ -1476,6 +1657,27 @@ mod tests {
     }
 
     #[test]
+    fn the_placeholder_can_start_a_window_drag_in_every_run() {
+        // Tauri checks IPC from a page on a custom scheme it serves as from a
+        // local origin (`Webview::is_local_url`): the placeholder, on its own
+        // scheme, or at http://fleetify-startup.localhost on Windows.
+        // default.json covers local origins, in release builds too.
+        for (run, authority, _) in app_runs() {
+            assert!(
+                authority
+                    .resolve_access(
+                        "window_start_dragging",
+                        MAIN_WINDOW,
+                        MAIN_WEBVIEW,
+                        &Origin::Local
+                    )
+                    .is_some(),
+                "{run}: the placeholder can't start a window drag"
+            );
+        }
+    }
+
+    #[test]
     fn the_browser_panel_can_call_no_command_at_all() {
         // The browser panel is a child webview in the main window. Even on a
         // page from the app's own origin it gets nothing: no app command and
@@ -1494,8 +1696,9 @@ mod tests {
 
     #[test]
     fn a_release_build_refuses_the_dev_server_origin() {
-        // The main webview has no navigation guard: a page it ends up on at
-        // http://localhost:3000, a user's own dev server say, gets nothing.
+        // The main webview's navigation guard only keeps it off the
+        // placeholder: a page it ends up on at http://localhost:3000, a
+        // user's own dev server say, gets nothing.
         let authority = release_authority(8765);
         let refused = |origin: &Origin| {
             authority
@@ -1681,5 +1884,129 @@ mod tests {
             "create_ipc_handler must pass every request through \
              postmessage_ipc_request(request, WEBKITGTK):\n{handler}"
         );
+    }
+
+    // ── The Browser panel gets no Tauri IPC ──
+    //
+    // The Browser panel loads any website, and none of its features use IPC:
+    // its script reports back through navigations the app intercepts, and
+    // the app drives it with native eval. The vendored runtime builds the
+    // webview with its label without an IPC handler, without Tauri's
+    // initialization scripts (the invoke key is in one) and, on macOS and
+    // Windows, without the `ipc` scheme. It keeps only the scripts that start
+    // with the marker (vendor/tauri-runtime-wry/FLEETIFY_PATCH.md).
+
+    /// The vendored runtime's source. (A Windows checkout may have CRLF line
+    /// endings.)
+    fn vendored_runtime() -> String {
+        include_str!("../../../vendor/tauri-runtime-wry/src/lib.rs").replace("\r\n", "\n")
+    }
+
+    /// `src/shell/ipc/mod.rs`, which builds the Browser panel.
+    fn ipc_module() -> String {
+        include_str!("ipc/mod.rs").replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn the_browser_panel_and_the_vendored_runtime_agree_on_its_label_and_marker() {
+        let runtime = vendored_runtime();
+        let ipc = ipc_module();
+        assert!(
+            runtime.contains(r#"pub const IPC_FREE_WEBVIEW_LABEL: &str = "browser-embed";"#),
+            "the vendored runtime must give the webview labelled \"browser-embed\" no IPC"
+        );
+        assert!(
+            ipc.contains(r#"pub(crate) const BROWSER_EMBED_LABEL: &str = "browser-embed";"#),
+            "the Browser panel must keep the label \"browser-embed\""
+        );
+        assert_eq!(BROWSER_EMBED_LABEL, "browser-embed");
+
+        assert!(
+            runtime.contains(
+                r#"pub const IPC_FREE_SCRIPT_MARKER: &str = "/* fleetify:browser-embed */";"#
+            ),
+            "the vendored runtime must keep the scripts marked /* fleetify:browser-embed */"
+        );
+        let (_, select_js) = ipc
+            .split_once(r##"const SELECT_JS: &str = r#""##)
+            .expect("ipc/mod.rs defines SELECT_JS as a raw string");
+        assert!(
+            select_js.starts_with("/* fleetify:browser-embed */\n"),
+            "SELECT_JS must start with the line /* fleetify:browser-embed */, or the \
+             Browser panel loses its element picker"
+        );
+
+        assert!(runtime.contains("FLEETIFY PATCH ipc-free-webview"));
+        assert!(runtime.contains("fn keep_script_in_ipc_free_webview("));
+    }
+
+    #[test]
+    fn the_vendored_runtime_builds_the_browser_panel_without_ipc() {
+        // A re-vendor must keep the patch's three call sites in
+        // create_webview, in this order. Whitespace is collapsed so a
+        // reformat doesn't matter.
+        let runtime = vendored_runtime();
+        let start = runtime
+            .find("fn create_webview<")
+            .expect("the vendored runtime has create_webview");
+        let create = &runtime[start..];
+        let create = &create[..create.find("\n}\n").expect("the function ends")];
+        let create = create.split_whitespace().collect::<Vec<_>>().join(" ");
+        let steps = [
+            // The Browser panel...
+            "let ipc_free = label == IPC_FREE_WEBVIEW_LABEL;",
+            // ...gets no IPC handler,
+            "if !ipc_free { webview_builder = webview_builder.with_ipc_handler(create_ipc_handler(",
+            // only the initialization scripts that carry the marker,
+            "for script in webview_attributes.initialization_scripts {",
+            "if ipc_free && !keep_script_in_ipc_free_webview(&script.script) { continue; }",
+            ".with_initialization_script_for_main_only(script.script, script.for_main_frame_only);",
+            // and no `ipc` scheme where each webview registers its own.
+            "for (scheme, protocol) in uri_scheme_protocols {",
+            r#"if ipc_free && scheme == "ipc" { continue; }"#,
+            ".with_asynchronous_custom_protocol(",
+        ];
+        let mut rest = create.as_str();
+        for step in steps {
+            let at = rest.find(step).unwrap_or_else(|| {
+                panic!("create_webview must have, after the steps before it:\n{step}")
+            });
+            rest = &rest[at + step.len()..];
+        }
+        assert_eq!(
+            runtime.matches(".with_ipc_handler(").count(),
+            1,
+            "create_webview's guarded call must be the runtime's only IPC handler"
+        );
+    }
+
+    use tauri_runtime_wry::{
+        keep_script_in_ipc_free_webview, IPC_FREE_SCRIPT_MARKER, IPC_FREE_WEBVIEW_LABEL,
+    };
+
+    use crate::shell::ipc::SELECT_JS;
+
+    #[test]
+    fn the_browser_panel_keeps_its_select_script_and_none_of_tauris() {
+        assert_eq!(BROWSER_EMBED_LABEL, IPC_FREE_WEBVIEW_LABEL);
+        assert_eq!(IPC_FREE_SCRIPT_MARKER, "/* fleetify:browser-embed */");
+        assert!(SELECT_JS.starts_with(&format!("{IPC_FREE_SCRIPT_MARKER}\n")));
+        assert!(keep_script_in_ipc_free_webview(SELECT_JS));
+        assert!(keep_script_in_ipc_free_webview(&format!(
+            "\n  {IPC_FREE_SCRIPT_MARKER}\n(function () {{}})();"
+        )));
+        // Tauri's scripts don't start with the marker: the first one it adds
+        // defines __TAURI_INTERNALS__, and the invoke key comes in another.
+        for script in [
+            "\n        Object.defineProperty(window, 'isTauri', {\n          value: true,\n        });\n",
+            "window.__TAURI_INTERNALS__.invoke('pty_spawn'); /* fleetify:browser-embed */",
+            "/* fleetify:browser */",
+            "",
+        ] {
+            assert!(
+                !keep_script_in_ipc_free_webview(script),
+                "the Browser panel would get {script:?}"
+            );
+        }
     }
 }

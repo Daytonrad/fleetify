@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, createEvent } from "@testing-library/react";
 import { AntigravitySdkSetupRow } from "../antigravity-sdk-setup";
 
 describe("AntigravitySdkSetupRow", () => {
@@ -16,8 +16,39 @@ describe("AntigravitySdkSetupRow", () => {
     expect(screen.getByText(/Python required/i)).toBeInTheDocument();
     const link = screen.getByRole("link", { name: /Download Python/i });
     expect(link).toHaveAttribute("href", "https://www.python.org/downloads/");
-    expect(link).toHaveAttribute("target", "_blank");
     expect(screen.queryByRole("button", { name: /^Setup$/ })).not.toBeInTheDocument();
+  });
+
+  it("opens the Python download page in the system browser, not in the app's window", () => {
+    // Tauri's webview refuses new windows: a `target="_blank"` link opened nothing.
+    const win = window as unknown as { electronAPI?: unknown };
+    const openExternal = vi.fn(() => Promise.resolve(true));
+    win.electronAPI = { openExternal };
+    // Sees the app code's window.open calls only: happy-dom follows a link
+    // through its own window object, not the global window.open.
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    try {
+      render(
+        <AntigravitySdkSetupRow
+          python={{ installed: false, version: null, path: null }}
+          sdkInstalled={false}
+          installing={false}
+          installError={null}
+          onSetup={vi.fn()}
+        />
+      );
+      const link = screen.getByRole("link", { name: /Download Python/i });
+      expect(link).not.toHaveAttribute("target");
+      const click = createEvent.click(link);
+      fireEvent(link, click);
+      // Cancelled, so the webview doesn't load the page in place of the app.
+      expect(click.defaultPrevented).toBe(true);
+      expect(open).not.toHaveBeenCalled();
+      expect(openExternal).toHaveBeenCalledWith("https://www.python.org/downloads/");
+    } finally {
+      open.mockRestore();
+      delete win.electronAPI;
+    }
   });
 
   it("renders Setup button when Python is present but SDK is not", () => {

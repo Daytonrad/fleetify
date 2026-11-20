@@ -6,12 +6,14 @@ running as a single Tauri v2 process with an embedded `axum` server.
 ## Architecture in one paragraph
 
 `crates/fleetify-backend` is a **library** crate (no `main.rs`). Its
-`serve(addr, static_dir)` entry point binds an `axum` router on
+`serve(addr, ServeOptions)` entry point binds an `axum` router on
 `127.0.0.1:8765` and returns a `ServerHandle`. The Tauri binary
 (`src-tauri/fleetify-app`) calls `fleetify_backend::serve(...)` from its
-`setup` hook on a tokio task — same process, same address space. The
-embedded UI (built React app from `../dist`) is served from the same
-origin, so there's no CORS in prod and no port forwarding anywhere.
+`setup` hook on a tokio task — same process, same address space. A
+release build serves the UI from files embedded in the binary, on the
+same origin and under a Content-Security-Policy, so there's no CORS in
+prod and no port forwarding anywhere. A debug build loads the UI from the
+Vite dev server.
 
 ```
 fleetify-app.exe (single Tauri binary)
@@ -98,6 +100,7 @@ shipped binary is ~20% smaller than a default release build.
 | `FLEETIFY_RESOURCE`      | `https://fleetify.dev/api`    | RFC 8707 resource indicator |
 | `FLEETIFY_DASHBOARD_URL` | `https://app.fleetify.dev`    | "Open dashboard" link target |
 | `FLEETIFY_NOAUTH`        | (unset)                       | `=1` ⇒ skip OAuth, sign in as a stub "John Doe", disable telemetry. Dev only. |
+| `FLEETIFY_REQUIRE_API_TOKEN` | (unset)                   | `=1` ⇒ the backend asks for the per-run API token even under `FLEETIFY_NOAUTH=1`. Dev only; release builds always ask for it. |
 | `FLEET_DB_URL`           | `sqlite://~/.fleetify/fleet.db?mode=rwc` | Override the local DB; tests set `sqlite::memory:` |
 | `GEMINI_API_KEY`         | (none)                        | Bypass interactive Gemini OAuth |
 | `GOOGLE_*`               | (none)                        | Vertex-AI auth (3 vars: API_KEY + PROJECT + LOCATION) |
@@ -113,6 +116,10 @@ The "Sign in with Fleetify" screen is bypassed; "Sign out" stays visible
 in Settings but is inert. Use this when the IdP is down or to iterate on
 UI without a network round-trip — release builds ignore the flag (prod
 issuer/resource URLs are pinned at compile time).
+
+The backend also stops asking API requests for the per-run token that the
+shell hands the renderer, so the UI works from a plain browser tab. Add
+`FLEETIFY_REQUIRE_API_TOKEN=1` to keep that check on in a no-auth run.
 
 ### Where things live
 

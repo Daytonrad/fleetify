@@ -65,7 +65,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Each runner image gets its own Rust cache: a cache saved on one image
+      # carries that image's MSVC paths (whisper-rs-sys's CMake build dir) and
+      # breaks the build on another image during an image rollout. The key is
+      # the image type and version; without a version the step fails rather
+      # than share one cache across images.
+      - name: Runner image version (cache key)
+        shell: pwsh
+        run: |
+          if (-not $env:ImageVersion) { throw 'The runner sets no ImageVersion, which the Rust cache key needs.' }
+          "IMAGE_VERSION=$env:ImageOS-$env:ImageVersion" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.IMAGE_VERSION }}
       # The 4 fleet-*-mcp sidecars are standalone workspace bins, NOT deps of
       # src-tauri — nothing compiles them implicitly. But Tauri's externalBin
       # build script resolves `binaries/fleet-*-mcp-<triple>` at build time, so
@@ -90,14 +102,14 @@ jobs:
       # twice. -D warnings makes any lint a failure; the workspace is clean.
       - name: Clippy (compile + lint)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # Test stays ADVISORY: ~6 tests fail on the Windows runner from
-      # path-separator (`\` vs `/`) + env assumptions, unrelated to app logic.
+      # Test stays ADVISORY (continue-on-error) and runs on the Windows runner.
       # Bounded so a test that hangs (binds a port / spawns a process and waits)
       # can't wedge the job — continue-on-error keeps a timeout non-blocking.
+      # --no-fail-fast: a failing test target must not stop the rest from running.
       - name: Test (advisory)
         continue-on-error: true
         timeout-minutes: 12
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       # Prebuilt cargo-audit binary — `cargo install --locked` compiles it from
       # source (several minutes) and pushed the job past its timeout. This pulls
       # a release binary in seconds. Bounded + continue-on-error so a slow or

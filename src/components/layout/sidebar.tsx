@@ -12,9 +12,10 @@ import { ProviderLogo } from "@/components/ui/provider-logo";
 import { useChatStore } from "@/stores/chat-store";
 import { useShallow } from "zustand/react/shallow";
 import { SessionContextMenu } from "@/components/layout/session-context-menu";
-import { forkSession, fetchBulkStats, stopSession, restartSession, resetSession, deleteSession } from "@/lib/api";
+import { forkSession, fetchBulkStats, stopSession, restartSession, resetSession, deleteSession, apiFetch } from "@/lib/api";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { usesInAppTitleBar, folderName } from "@/lib/utils";
+import { openExternalUrl } from "@/lib/links";
 import { canDropOn, planSessionDrop } from "@/lib/sidebar-dnd";
 import { formatShortcut } from "@/lib/keyboard-shortcuts";
 import { isStudioTool } from "@/lib/studio-tools";
@@ -31,20 +32,12 @@ type SessionStats = { message_count: number; total_cost_usd: number };
 
 /* ── helpers ── */
 
-/** Open the public docs site in the user's default browser.
- *  Prefers Electron's `shell.openExternal` (via the preload bridge) so
- *  the URL lands in Chrome/Safari/Firefox instead of a new Electron
- *  BrowserWindow; falls back to `window.open` for the dev web view
- *  where the bridge isn't mounted. Used by every "Get Help" / "Help"
- *  row across the sidebar surfaces (main, collapsed rail, Settings,
- *  Library) so the affordance behaves the same everywhere. */
+/** Open the public docs site in the user's default browser
+ *  (`openExternalUrl`). Used by every "Get Help" / "Help" row across the
+ *  sidebar surfaces (main, collapsed rail, Settings, Library) so the
+ *  affordance behaves the same everywhere. */
 export function openDocs(): void {
-  const url = "https://fleetify.dev/docs";
-  if (window.electronAPI?.openExternal) {
-    window.electronAPI.openExternal(url).catch(() => {});
-  } else {
-    window.open(url, "_blank", "noopener,noreferrer");
-  }
+  openExternalUrl("https://fleetify.dev/docs");
 }
 
 function timeAgo(iso: string | null): string {
@@ -712,7 +705,7 @@ export function Sidebar() {
 
   const handlePin = useCallback(async (session: Session) => {
     const p = !session.pinned;
-    await fetch(`/api/sessions/${session.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: p }) });
+    await apiFetch(`/api/sessions/${session.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned: p }) });
     updateSession(session.id, { pinned: p });
   }, [updateSession]);
 
@@ -799,7 +792,7 @@ export function Sidebar() {
     next.forEach((id, i) => updateSession(id, { order_idx: i } as Partial<Session>));
     Promise.allSettled(
       next.map((id, i) =>
-        fetch(`/api/sessions/${id}`, {
+        apiFetch(`/api/sessions/${id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ order_idx: i }),

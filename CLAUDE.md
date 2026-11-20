@@ -121,6 +121,8 @@ Always use `npm run dev:tauri:wt` (not `npm run dev:tauri`) so the test instance
    worktree's FLEETIFY_HOME is preserved across re-runs (deterministic slot).
 ```
 
+For a webview-driven smoke run, start it as `FLEETIFY_REQUIRE_API_TOKEN=1 npm run dev:tauri:wt`: the run is no-auth by default, which also turns off the per-run API token check, and this keeps the check on (see `docs/RUNNING.md`).
+
 **Don't fake an E2E pass.** Type-checking + unit tests verify *code correctness*; only running the actual app verifies *feature correctness*. If you can't drive the UI (no display, no agent-browser available), say so explicitly in the PR rather than claiming a green smoke test.
 
 ### Tests that change behavior
@@ -249,26 +251,26 @@ sends.
 | Channel | Vendor | Default | Toggle | Outbox |
 |---|---|---|---|---|
 | Dashboard sync | Fleetify cloud (`fleetify.dev`, WebSocket) | **ON** | Settings → Privacy → "Dashboard sync" | `~/.fleetify/telemetry-outbox.sqlite` |
-| Product analytics | PostHog Cloud (US, HTTP `/batch`) | **OFF** | Settings → Privacy → "Product analytics" | `~/.fleetify/posthog-outbox.sqlite` |
+| Product analytics | PostHog Cloud (EU, Frankfurt, HTTP `/batch`) | **OFF** | Settings → Privacy → "Product analytics" | `~/.fleetify/posthog-outbox.sqlite` |
 
 ### PostHog integration
 
 - **Code:** backend module at `crates/fleetify-backend/src/services/telemetry/posthog/`; frontend wrapper at `src/lib/posthog.ts`.
 - **Fan-out:** the existing `services/telemetry/emitters.rs::enqueue_payload` writes to both the Fleetify cloud outbox AND the PostHog outbox (the latter via `posthog::enqueue_if_enabled`, gated on a runtime `AtomicBool`).
 - **distinct_id:** the persisted `device_id` from `device.json` is reused on both sides. Frontend `posthog.identify(user_id)` runs at sign-in, at each launch while signed in, and at opt-in, and only while product analytics is on; it merges the anonymous person into the authenticated one via `$anon_distinct_id`, with the id only (`before_send` strips `$set` / `$set_once`).
-- **Env keys:** `POSTHOG_API_KEY` (Rust, runtime `std::env::var`) and `VITE_POSTHOG_KEY` (Vite, `import.meta.env`). Unset → backend `init` short-circuits and the renderer wrapper no-ops. `POSTHOG_HOST` / `VITE_POSTHOG_HOST` default to `https://us.i.posthog.com`.
+- **Env keys:** `POSTHOG_API_KEY` (Rust, runtime `std::env::var`) and `VITE_POSTHOG_KEY` (Vite, `import.meta.env`). Unset → backend `init` short-circuits and the renderer wrapper no-ops. `POSTHOG_HOST` / `VITE_POSTHOG_HOST` default to `https://eu.i.posthog.com`.
 - **Runtime gate:** `telemetry_set_posthog_enabled` Tauri command persists the flag in `fleet.config.json::telemetry.posthog_enabled` AND flips the backend's `ENABLED` atomic live. Live opt-out stops new sends within ~10 s; the renderer's `optOut()` opts posthog-js out at once and drops every request it would still make, queued events and retries included.
 
 ### Local dev
 
-Single source of truth is a `.env` file in the workspace root (gitignored — `.env.example` is the committed template). `dotenvy::dotenv()` runs at the top of `serve_with_routing_setup` so the Rust backend picks up the keys via `std::env::var`; Vite reads the same `.env` natively for the renderer.
+Single source of truth is a `.env` file in the workspace root (gitignored — `.env.example` is the committed template). `dotenvy::dotenv()` runs at the top of `serve` so the Rust backend picks up the keys via `std::env::var`; Vite reads the same `.env` natively for the renderer.
 
 ```
 # .env (gitignored)
 POSTHOG_API_KEY=phc_yourtestprojectkey
 VITE_POSTHOG_KEY=phc_yourtestprojectkey
-POSTHOG_HOST=https://us.i.posthog.com
-VITE_POSTHOG_HOST=https://us.i.posthog.com
+POSTHOG_HOST=https://eu.i.posthog.com
+VITE_POSTHOG_HOST=https://eu.i.posthog.com
 ```
 
 Then just run `npm run dev:tauri:wt` — no shell env juggling, no `cargo clean` needed because the keys are read at runtime now (was `option_env!` baked-at-compile, dropped in favour of runtime resolution). Shell-set env vars still win over `.env` so CI / production injection paths are unchanged.

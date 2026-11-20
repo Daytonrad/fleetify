@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::shell::startup_window::MAIN_WINDOW;
 use crate::shell::{
     ai_git, auth, config, feedback, git, github_link, head_watcher, logging, pty, voice,
 };
@@ -49,6 +50,15 @@ pub async fn auth_get_state() -> serde_json::Value {
     auth::get_state().await
 }
 
+// ── window.fleetify.getApiToken ───────────────────────────────────
+// This run's backend API token: setup (lib.rs) generates it, manages it and
+// passes it to the embedded backend. The renderer asks for it here.
+
+#[tauri::command]
+pub fn backend_api_token(token: tauri::State<'_, fleetify_backend::access::ApiToken>) -> String {
+    token.as_str().to_owned()
+}
+
 // ── window.electronAPI.{getConfig,setConfig} ──────────────────────
 // Persisted under Tauri's per-app data dir (parity with the Electron
 // `electron-store`-style JSON-on-disk the original used).
@@ -61,12 +71,14 @@ pub async fn config_get(app: tauri::AppHandle) -> serde_json::Value {
     }
 }
 
-/// Replaces `fleet.config.json` with `config`. A failed save answers
-/// `{ ok: false, error }`.
+/// Replaces `fleet.config.json` with `config`, except the `telemetry`
+/// section: that keeps what the file holds, since only the privacy switches
+/// save it (`config::replace_config_keeping_telemetry`). A failed save
+/// answers `{ ok: false, error }`.
 #[tauri::command]
 pub async fn config_set(app: tauri::AppHandle, config: serde_json::Value) -> serde_json::Value {
     let saved = match app.path().app_data_dir() {
-        Ok(dir) => config::save_config_to(&dir, &config)
+        Ok(dir) => config::replace_config_keeping_telemetry(&dir, config)
             .map_err(|e| format!("Couldn't save Fleetify's settings: {e}")),
         Err(e) => Err(format!("Couldn't find Fleetify's settings folder: {e}")),
     };
@@ -80,40 +92,59 @@ pub async fn config_set(app: tauri::AppHandle, config: serde_json::Value) -> ser
 }
 
 // ── Telemetry config (PostHog + Fleetify cloud sync) ──────────────
-// Renderer fetches `{ distinct_id, posthog_enabled, cloud_enabled }` at
-// boot; `distinct_id` initialises posthog-js with the same device_id the
-// Rust backend uses, so frontend + backend events flow to one PostHog
-// person. Each setter both persists its flag AND flips the matching
-// backend runtime gate live, so the PostHog worker / the cloud WS loop
-// stops or starts without a restart.
+// Renderer fetches `{ distinct_id, posthog_enabled, cloud_enabled,
+// cloud_choice }` at boot; `distinct_id` initialises posthog-js with the
+// same device_id the Rust backend uses, so frontend + backend events flow
+// to one PostHog person. Each setter both persists its flag AND flips the
+// matching backend runtime gate live, so the PostHog worker / the cloud WS
+// loop stops or starts without a restart.
 
 #[tauri::command]
-pub async fn telemetry_get_config() -> serde_json::Value {
+pub async fn telemetry_get_config(app: tauri::AppHandle) -> serde_json::Value {
     let device = fleetify_backend::services::telemetry::device_id::get_or_create();
-    telemetry_config_now(device.device_id)
+    let config_dir = app.path().app_data_dir().ok();
+    telemetry_config_now(device.device_id, config_dir.as_deref())
 }
 
-/// The two flags are the backend's live gates, not the saved choices. They
-/// differ after a failed save (the gate still follows the switch for this
-/// session), and the Settings card has to show what is actually on. The
-/// shell sets both gates from the saved choices as soon as it starts
-/// (lib.rs), before the warm-up, so the renderer's launch read sees them.
-fn telemetry_config_now(distinct_id: String) -> serde_json::Value {
+/// The two `_enabled` flags are the backend's live gates, not the saved
+/// choices. They differ after a failed save (the gate still follows the
+/// switch for this session), and the Settings card has to show what is
+/// actually on. The shell sets both gates from the saved choices as soon as
+/// it starts (lib.rs), before the warm-up, so the renderer's launch read
+/// sees them.
+///
+/// `cloud_choice` is the dashboard sync choice saved in `config_dir`
+/// (`config::saved_cloud_choice`): `true` or `false`, or `null` when there
+/// is none. The renderer asks the dashboard question once while it is
+/// `null` (`DashboardSyncNotice`), and the gate stays closed until then. A
+/// settings folder that can't be found counts as a settings file that
+/// can't be read: off.
+fn telemetry_config_now(
+    distinct_id: String,
+    config_dir: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let cloud_choice = config_dir.map_or(Some(false), config::saved_cloud_choice);
     serde_json::json!({
         "distinct_id": distinct_id,
         "posthog_enabled": fleetify_backend::services::telemetry::posthog::is_enabled(),
         "cloud_enabled": fleetify_backend::services::telemetry::cloud_enabled(),
+        "cloud_choice": cloud_choice,
     })
 }
 
-/// Whether Settings has set cloud sync since launch. The startup restore
-/// (lib.rs) ends seconds after launch, after the warm-up, and must not undo
-/// a choice the user made meanwhile, including one whose save failed. The
-/// setter and the restore both hold this lock while they touch the gate, so
-/// whichever runs second sees the other.
+/// Whether the user has set cloud sync since launch, in Settings or by
+/// answering the dashboard question (`telemetry_set_cloud_enabled`). The
+/// startup restore (lib.rs) runs at the end of the boot warm-up task: after
+/// the backend has reported its start, a wait with no time limit, and once
+/// it has bound, after the health wait (up to 14 s) and the provider
+/// warm-up. The clone-token push runs in a task of its own and isn't waited
+/// for. The restore can end long after launch, and must not undo a choice
+/// the user made meanwhile, including one whose save failed. The setter and
+/// the restore both hold this lock while they touch the gate, so whichever
+/// runs second sees the other.
 static CLOUD_SYNC_SET_SINCE_LAUNCH: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
 
-/// Settings' change to the cloud gate: records that the user chose, then
+/// The user's change to the cloud gate: records that the user chose, then
 /// applies it.
 async fn set_cloud_sync(set_since_launch: &tokio::sync::Mutex<bool>, enabled: bool) {
     let mut set = set_since_launch.lock().await;
@@ -121,10 +152,10 @@ async fn set_cloud_sync(set_since_launch: &tokio::sync::Mutex<bool>, enabled: bo
     fleetify_backend::services::telemetry::set_cloud_enabled(enabled).await;
 }
 
-/// The end of the startup restore. It can only close the gate: when the
-/// saved choice is off (closing also purges what is still queued), and only
-/// if Settings hasn't set it since launch. It never opens the gate; the
-/// early restore already opened it when the saved choice is on.
+/// The end of the startup restore. It can only close the gate: when no
+/// saved choice says on (closing also purges what is still queued), and
+/// only if the user hasn't set it since launch. It never opens the gate;
+/// the early restore already opened it when the saved choice is on.
 async fn finish_cloud_sync_restore_with(
     set_since_launch: &tokio::sync::Mutex<bool>,
     saved_on: bool,
@@ -139,9 +170,10 @@ pub(crate) async fn finish_cloud_sync_restore(saved_on: bool) {
     finish_cloud_sync_restore_with(&CLOUD_SYNC_SET_SINCE_LAUNCH, saved_on).await;
 }
 
-/// Settings → Privacy's Fleetify-cloud sync switch. Saves the choice
-/// (`config::persist_cloud_choice`), then sets the backend gate: turning it
-/// off purges anything still queued and drops the dashboard socket.
+/// Settings → Privacy's Fleetify-cloud sync switch, and the dashboard
+/// question's buttons. Saves the choice (`config::persist_cloud_choice`),
+/// then sets the backend gate: turning it off purges anything still queued
+/// and drops the dashboard socket.
 ///
 /// The gate follows the switch for this session even when the save fails,
 /// but the saved choice then still decides the next launch, so the failure
@@ -262,7 +294,8 @@ pub async fn shell_show_item_in_folder(path: String) -> serde_json::Value {
     // The path is checked and resolved first (`open_external::path_to_reveal`):
     // a Windows network path is refused before anything looks at it, since
     // even checking that it exists signs in to the host, and the file manager
-    // is handed the resolved path.
+    // is handed the item itself in its resolved folder (a symlink, not its
+    // target).
     use fleetify_backend::open_external::{path_to_reveal, PathRefused};
     let p = match path_to_reveal(std::path::Path::new(&path)) {
         Ok(resolved) => resolved,
@@ -375,28 +408,39 @@ pub async fn detect_editors() -> serde_json::Value {
     serde_json::json!({ "editors": editors })
 }
 
-/// Launch the project directory in the chosen editor. Spawns the
-/// resolved absolute binary with the path as its sole argument — same
-/// detached-spawn pattern as `reveal_in_file_manager`, no shell.
+/// The path to open in an editor, checked and resolved the way Reveal checks
+/// it (`open_external::path_to_reveal`), or the message the renderer is told
+/// when it is refused. It must be absolute and exist, and a Windows network
+/// or device path is refused before anything looks at it, since even
+/// checking that it exists signs in to the host.
+fn editor_target(path: &str) -> Result<std::path::PathBuf, String> {
+    use fleetify_backend::open_external::{path_to_reveal, PathRefused};
+    path_to_reveal(std::path::Path::new(path)).map_err(|refused| match refused {
+        PathRefused::Unresolvable(_) => format!("path does not exist: {path}"),
+        _ => PATH_REFUSED.to_string(),
+    })
+}
+
+/// Launch the project directory in the chosen editor. The path is checked
+/// first (`editor_target`), then the resolved absolute binary is spawned
+/// with the resolved path as its sole argument — same detached-spawn
+/// pattern as `reveal_in_file_manager`, no shell.
 #[tauri::command]
 pub async fn open_in_editor(editor_id: String, path: String) -> serde_json::Value {
     let Some(bin) = editor_bin(&editor_id) else {
         return serde_json::json!({ "ok": false, "error": format!("unknown editor: {editor_id}") });
     };
-    let p = std::path::PathBuf::from(&path);
-    if !p.exists() {
-        return serde_json::json!({
-            "ok": false,
-            "error": format!("path does not exist: {}", p.display())
-        });
-    }
+    let target = match editor_target(&path) {
+        Ok(target) => target,
+        Err(error) => return serde_json::json!({ "ok": false, "error": error }),
+    };
     let exe = match which::which(bin) {
         Ok(e) => e,
         Err(e) => {
             return serde_json::json!({ "ok": false, "error": format!("{bin} not found: {e}") })
         }
     };
-    match std::process::Command::new(exe).arg(&p).spawn() {
+    match std::process::Command::new(exe).arg(&target).spawn() {
         Ok(_) => serde_json::json!({ "ok": true }),
         Err(e) => serde_json::json!({ "ok": false, "error": format!("launch {bin}: {e}") }),
     }
@@ -418,6 +462,10 @@ pub async fn clipboard_write(text: String) -> serde_json::Value {
 // panel reports its slot's logical rect; we position the child webview
 // there and keep it in sync on scroll / resize. Login state + a site's
 // remembered theme PERSIST across launches via a fixed profile id.
+/// The Browser panel's webview label. The vendored runtime builds the webview
+/// with this label without Tauri IPC (`IPC_FREE_WEBVIEW_LABEL`, see
+/// vendor/tauri-runtime-wry/FLEETIFY_PATCH.md), so the two must stay equal;
+/// the startup_window tests check it.
 pub(crate) const BROWSER_EMBED_LABEL: &str = "browser-embed";
 const BROWSER_EMBED_PROFILE: [u8; 16] = *b"fleetbrowser0001";
 // A CURRENT Safari UA so sites (Google) serve their MODERN layout instead of
@@ -446,7 +494,11 @@ const READ_MARKER: &str = "fleet.internal/read/";
 // React/Vue component + dev source when detectable). Everything posts back
 // via the fragment sentinel; {action:"copy"|"dismiss"} messages ride the
 // same channel.
-const SELECT_JS: &str = r#"(function () {
+// Its first line is the marker the vendored runtime keeps it by: the panel
+// gets no Tauri initialization scripts, only the app's marked ones
+// (`IPC_FREE_SCRIPT_MARKER`).
+pub(crate) const SELECT_JS: &str = r#"/* fleetify:browser-embed */
+(function () {
   if (window.__fleetSelInit) return; window.__fleetSelInit = true;
   var active = false, mode = 'ask', box = null, last = null, promptHost = null, menuHost = null, bubbleHost = null, swallowClick = false, promptKey = null, cursorStyle = null;
   // Press beats click: pages like YouTube and Google sign-in install their
@@ -1028,8 +1080,9 @@ pub async fn browser_embed_create(
         .user_agent(BROWSER_EMBED_UA)
         // Element-select content script (see SELECT_JS). Runs at document
         // start on every page; the picked element is handed back via a URL
-        // fragment sentinel which we read in on_navigation below — so the
-        // visited site is NEVER granted IPC access to the app.
+        // fragment sentinel which we read in on_navigation below. It is the
+        // only script this webview gets: the vendored runtime gives it no
+        // Tauri IPC (see BROWSER_EMBED_LABEL).
         .initialization_script(SELECT_JS)
         .on_navigation(move |url| {
             // The content script hands data back by NAVIGATING to a sentinel
@@ -1291,8 +1344,12 @@ pub async fn browser_embed_close(app: tauri::AppHandle) -> serde_json::Value {
 }
 
 // ── window controls ──────────────────────────────────────────────
-fn main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
-    app.get_webview_window("main")
+/// The main window, for the window controls below. Looked up as a window:
+/// `get_webview_window` finds a window only while every webview in it has
+/// the window's label, so not while the Browser panel's child webview is
+/// attached.
+fn main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
+    app.get_window(MAIN_WINDOW)
 }
 
 #[tauri::command]
@@ -3350,17 +3407,18 @@ pub async fn routers_connect(
         return serde_json::json!({ "ok": false, "code": "KEYCHAIN", "error": e });
     }
     if let Ok(dir) = app.path().app_data_dir() {
-        let mut cfg = config::load_config_from(&dir);
-        let mut routing = config::routing_from(&cfg);
-        routing.connected_routers.insert(
-            id.clone(),
-            config::ConnectedRouter {
-                connected: true,
-                metadata,
-            },
-        );
-        config::routing_set(&mut cfg, &routing);
-        if let Err(e) = config::save_config_to(&dir, &cfg) {
+        let saved = config::update_config(&dir, |cfg| {
+            let mut routing = config::routing_from(cfg);
+            routing.connected_routers.insert(
+                id.clone(),
+                config::ConnectedRouter {
+                    connected: true,
+                    metadata,
+                },
+            );
+            config::routing_set(cfg, &routing);
+        });
+        if let Err(e) = saved {
             return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
         }
     }
@@ -3376,17 +3434,17 @@ pub async fn routers_disconnect(app: tauri::AppHandle, id: String) -> serde_json
         let _ = crate::shell::routers_link::delete_secret(&id, &uid);
     }
     if let Ok(dir) = app.path().app_data_dir() {
-        let mut cfg = config::load_config_from(&dir);
-        let mut routing = config::routing_from(&cfg);
-        routing.connected_routers.remove(&id);
-        if routing.active_decision_router == id {
-            routing.active_decision_router = "builtin".into();
-        }
-        if routing.active_proxy_gateway == id {
-            routing.active_proxy_gateway = "none-proxy".into();
-        }
-        config::routing_set(&mut cfg, &routing);
-        let _ = config::save_config_to(&dir, &cfg);
+        let _ = config::update_config(&dir, |cfg| {
+            let mut routing = config::routing_from(cfg);
+            routing.connected_routers.remove(&id);
+            if routing.active_decision_router == id {
+                routing.active_decision_router = "builtin".into();
+            }
+            if routing.active_proxy_gateway == id {
+                routing.active_proxy_gateway = "none-proxy".into();
+            }
+            config::routing_set(cfg, &routing);
+        });
     }
     crate::shell::routing_setup::reload_backend(&app).await;
     serde_json::json!({ "ok": true })
@@ -3401,15 +3459,21 @@ pub async fn routers_set_active(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut routing = config::routing_from(&cfg);
-    match category.as_str() {
-        "decision" => routing.active_decision_router = id,
-        "proxy" => routing.active_proxy_gateway = id,
+    // Checked before anything is saved.
+    let decision = match category.as_str() {
+        "decision" => true,
+        "proxy" => false,
         _ => return serde_json::json!({ "ok": false, "error": "invalid category" }),
-    }
-    config::routing_set(&mut cfg, &routing);
-    let _ = config::save_config_to(&dir, &cfg);
+    };
+    let _ = config::update_config(&dir, |cfg| {
+        let mut routing = config::routing_from(cfg);
+        if decision {
+            routing.active_decision_router = id;
+        } else {
+            routing.active_proxy_gateway = id;
+        }
+        config::routing_set(cfg, &routing);
+    });
     crate::shell::routing_setup::reload_backend(&app).await;
     serde_json::json!({ "ok": true })
 }
@@ -3419,11 +3483,11 @@ pub async fn routers_set_master_toggle(app: tauri::AppHandle, enabled: bool) -> 
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut routing = config::routing_from(&cfg);
-    routing.enabled = enabled;
-    config::routing_set(&mut cfg, &routing);
-    let _ = config::save_config_to(&dir, &cfg);
+    let _ = config::update_config(&dir, |cfg| {
+        let mut routing = config::routing_from(cfg);
+        routing.enabled = enabled;
+        config::routing_set(cfg, &routing);
+    });
     crate::shell::routing_setup::reload_backend(&app).await;
     serde_json::json!({ "ok": true })
 }
@@ -3596,11 +3660,12 @@ pub async fn providers_set_key(
         return serde_json::json!({ "ok": false, "code": "KEYCHAIN", "error": e });
     }
     if let Ok(dir) = app.path().app_data_dir() {
-        let mut cfg = config::load_config_from(&dir);
-        let mut providers = config::providers_from(&cfg);
-        providers.connected.insert(id.clone(), true);
-        config::providers_set(&mut cfg, &providers);
-        if let Err(e) = config::save_config_to(&dir, &cfg) {
+        let saved = config::update_config(&dir, |cfg| {
+            let mut providers = config::providers_from(cfg);
+            providers.connected.insert(id.clone(), true);
+            config::providers_set(cfg, &providers);
+        });
+        if let Err(e) = saved {
             return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
         }
     }
@@ -3634,11 +3699,11 @@ pub async fn providers_delete_key(app: tauri::AppHandle, id: String) -> serde_js
         let _ = crate::shell::providers_link::delete_secret(&id, &uid);
     }
     if let Ok(dir) = app.path().app_data_dir() {
-        let mut cfg = config::load_config_from(&dir);
-        let mut providers = config::providers_from(&cfg);
-        providers.connected.insert(id.clone(), false);
-        config::providers_set(&mut cfg, &providers);
-        let _ = config::save_config_to(&dir, &cfg);
+        let _ = config::update_config(&dir, |cfg| {
+            let mut providers = config::providers_from(cfg);
+            providers.connected.insert(id.clone(), false);
+            config::providers_set(cfg, &providers);
+        });
     }
     crate::shell::providers_setup::reload_backend(&app).await;
     fleetify_backend::services::telemetry::emitters::emit_provider_disconnected(&id).await;
@@ -3845,11 +3910,12 @@ pub async fn providers_set_enabled(
         return serde_json::json!({ "ok": false, "code": "UNKNOWN_PROVIDER", "error": format!("unknown provider {id}") });
     }
     if let Ok(dir) = app.path().app_data_dir() {
-        let mut cfg = config::load_config_from(&dir);
-        let mut providers = config::providers_from(&cfg);
-        providers.connected.insert(id.clone(), enabled);
-        config::providers_set(&mut cfg, &providers);
-        if let Err(e) = config::save_config_to(&dir, &cfg) {
+        let saved = config::update_config(&dir, |cfg| {
+            let mut providers = config::providers_from(cfg);
+            providers.connected.insert(id.clone(), enabled);
+            config::providers_set(cfg, &providers);
+        });
+        if let Err(e) = saved {
             return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
         }
     } else {
@@ -3888,16 +3954,17 @@ pub async fn providers_set_connected_bulk(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut providers = config::providers_from(&cfg);
-    for (id, on) in &connected {
-        providers.connected.insert(id.clone(), *on);
-    }
-    if let Some(agents) = enabled_agents {
-        providers.enabled_agents = agents;
-    }
-    config::providers_set(&mut cfg, &providers);
-    if let Err(e) = config::save_config_to(&dir, &cfg) {
+    let saved = config::update_config(&dir, |cfg| {
+        let mut providers = config::providers_from(cfg);
+        for (id, on) in &connected {
+            providers.connected.insert(id.clone(), *on);
+        }
+        if let Some(agents) = enabled_agents {
+            providers.enabled_agents = agents;
+        }
+        config::providers_set(cfg, &providers);
+    });
+    if let Err(e) = saved {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
     }
     crate::shell::providers_setup::reload_backend(&app).await;
@@ -3935,8 +4002,7 @@ pub async fn providers_set_default(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    match &mut cfg {
+    let saved = config::update_config(&dir, |cfg| match cfg {
         serde_json::Value::Object(map) => {
             map.insert(
                 "defaultProvider".into(),
@@ -3947,13 +4013,13 @@ pub async fn providers_set_default(
             }
         }
         _ => {
-            cfg = serde_json::json!({
-                "defaultProvider": id,
-                "defaultModel": default_model,
+            *cfg = serde_json::json!({
+                "defaultProvider": id.clone(),
+                "defaultModel": default_model.clone(),
             });
         }
-    }
-    if let Err(e) = config::save_config_to(&dir, &cfg) {
+    });
+    if let Err(e) = saved {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
     }
     // No backend reload needed — `defaultProvider` is consumed
@@ -4573,11 +4639,12 @@ pub async fn providers_set_enabled_models(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut providers = config::providers_from(&cfg);
-    providers.enabled_models.insert(id, models);
-    config::providers_set(&mut cfg, &providers);
-    if let Err(e) = config::save_config_to(&dir, &cfg) {
+    let saved = config::update_config(&dir, |cfg| {
+        let mut providers = config::providers_from(cfg);
+        providers.enabled_models.insert(id, models);
+        config::providers_set(cfg, &providers);
+    });
+    if let Err(e) = saved {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
     }
     // Picker reads renderer-side state via the Zustand store, which the
@@ -4593,16 +4660,18 @@ pub async fn providers_set_ollama_base_url(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut providers = config::providers_from(&cfg);
     let trimmed = base_url.trim().to_string();
-    providers.ollama_base_url = if trimmed.is_empty() {
+    let base_url = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     };
-    config::providers_set(&mut cfg, &providers);
-    if let Err(e) = config::save_config_to(&dir, &cfg) {
+    let saved = config::update_config(&dir, |cfg| {
+        let mut providers = config::providers_from(cfg);
+        providers.ollama_base_url = base_url;
+        config::providers_set(cfg, &providers);
+    });
+    if let Err(e) = saved {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
     }
     crate::shell::providers_setup::reload_backend(&app).await;
@@ -4617,16 +4686,18 @@ pub async fn providers_set_ollama_cloud_base_url(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut providers = config::providers_from(&cfg);
     let trimmed = base_url.trim().to_string();
-    providers.ollama_cloud_base_url = if trimmed.is_empty() {
+    let base_url = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     };
-    config::providers_set(&mut cfg, &providers);
-    if let Err(e) = config::save_config_to(&dir, &cfg) {
+    let saved = config::update_config(&dir, |cfg| {
+        let mut providers = config::providers_from(cfg);
+        providers.ollama_cloud_base_url = base_url;
+        config::providers_set(cfg, &providers);
+    });
+    if let Err(e) = saved {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
     }
     crate::shell::providers_setup::reload_backend(&app).await;
@@ -4641,16 +4712,18 @@ pub async fn providers_set_cloudflare_account_id(
     let Ok(dir) = app.path().app_data_dir() else {
         return serde_json::json!({ "ok": false, "error": "no app data dir" });
     };
-    let mut cfg = config::load_config_from(&dir);
-    let mut providers = config::providers_from(&cfg);
     let trimmed = account_id.trim().to_string();
-    providers.cloudflare_account_id = if trimmed.is_empty() {
+    let account_id = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     };
-    config::providers_set(&mut cfg, &providers);
-    if let Err(e) = config::save_config_to(&dir, &cfg) {
+    let saved = config::update_config(&dir, |cfg| {
+        let mut providers = config::providers_from(cfg);
+        providers.cloudflare_account_id = account_id;
+        config::providers_set(cfg, &providers);
+    });
+    if let Err(e) = saved {
         return serde_json::json!({ "ok": false, "code": "CONFIG", "error": e.to_string() });
     }
     crate::shell::providers_setup::reload_backend(&app).await;
@@ -4660,6 +4733,25 @@ pub async fn providers_set_cloudflare_account_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_controls_look_the_main_window_up_as_a_window() {
+        // Drag, minimize, maximize, close, resize and the taskbar icon go
+        // through main_window(). get_webview_window would find no window
+        // while the Browser panel's child webview is attached (see
+        // focus_main_window in lib.rs). Whitespace removed, so line wrapping
+        // doesn't matter; the needle is built at run time, so this test
+        // never matches itself.
+        let source: String = include_str!("mod.rs").split_whitespace().collect();
+        let wanted = format!(
+            "fn{}(app:&tauri::AppHandle)->Option<tauri::Window>{{app.{}(MAIN_WINDOW)}}",
+            "main_window", "get_window"
+        );
+        assert!(
+            source.contains(&wanted),
+            "main_window must be app.get_window(MAIN_WINDOW), a tauri::Window"
+        );
+    }
 
     #[tokio::test]
     async fn a_path_that_isnt_a_folder_or_document_is_refused_with_a_message() {
@@ -4954,6 +5046,60 @@ mod editor_tests {
         ));
         assert_eq!(r["ok"], false);
     }
+
+    #[test]
+    fn a_relative_or_missing_path_is_not_opened_in_an_editor() {
+        // A relative path is refused even when it exists ("." does): it
+        // would be resolved against the working directory.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
+        for path in ["relative/dir", "."] {
+            assert_eq!(
+                editor_target(path),
+                Err(PATH_REFUSED.to_string()),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            editor_target(&missing),
+            Err(format!("path does not exist: {missing}"))
+        );
+    }
+
+    #[test]
+    fn an_existing_folder_opens_in_an_editor_by_its_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("proj")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let canonical = fleetify_core::canonicalize_no_verbatim(&dir.path().join("proj")).unwrap();
+        for path in [
+            dir.path().join("proj"),
+            dir.path().join("sub").join("..").join("proj"),
+        ] {
+            assert_eq!(
+                editor_target(&path.to_string_lossy()),
+                Ok(canonical.clone()),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_is_not_opened_in_an_editor() {
+        assert_eq!(
+            editor_target(r"\\server\share\x"),
+            Err(PATH_REFUSED.to_string())
+        );
+    }
+
+    #[test]
+    fn open_in_editor_checks_the_path_before_looking_for_the_editor() {
+        // Refused before the editor is looked up: nothing is launched here.
+        let r =
+            tauri::async_runtime::block_on(open_in_editor("vscode".into(), "relative/dir".into()));
+        assert_eq!(r, serde_json::json!({ "ok": false, "error": PATH_REFUSED }));
+    }
 }
 
 #[cfg(test)]
@@ -4992,30 +5138,69 @@ mod telemetry_config_tests {
     fn telemetry_config_reports_the_live_gates() {
         let _turn = GATES.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = RestoreGates::now();
+        let dir = tempfile::tempdir().unwrap();
 
         // After a failed save the gates differ from the saved choices, and a
         // re-mounted Settings card has to show the gates.
         posthog::set_enabled(true);
         block_on(set_cloud_enabled(false));
         assert_eq!(
-            telemetry_config_now("device-1".into()),
+            telemetry_config_now("device-1".into(), Some(dir.path())),
             serde_json::json!({
                 "distinct_id": "device-1",
                 "posthog_enabled": true,
                 "cloud_enabled": false,
+                "cloud_choice": null,
             })
         );
 
         posthog::set_enabled(false);
         block_on(set_cloud_enabled(true));
         assert_eq!(
-            telemetry_config_now("device-1".into()),
+            telemetry_config_now("device-1".into(), Some(dir.path())),
             serde_json::json!({
                 "distinct_id": "device-1",
                 "posthog_enabled": false,
                 "cloud_enabled": true,
+                "cloud_choice": null,
             })
         );
+    }
+
+    #[test]
+    fn telemetry_config_reports_the_saved_cloud_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let reported = |dir: Option<&std::path::Path>| {
+            telemetry_config_now("device-1".into(), dir)["cloud_choice"].clone()
+        };
+
+        // Nothing saved yet, or an install that finished onboarding before
+        // it asked: no choice, so the renderer asks.
+        assert_eq!(reported(Some(dir.path())), serde_json::Value::Null);
+        config::save_config_to(dir.path(), &serde_json::json!({"onboardingComplete": true}))
+            .unwrap();
+        assert_eq!(reported(Some(dir.path())), serde_json::Value::Null);
+
+        config::persist_cloud_choice(dir.path(), true).unwrap();
+        assert_eq!(reported(Some(dir.path())), serde_json::json!(true));
+        config::persist_cloud_choice(dir.path(), false).unwrap();
+        assert_eq!(reported(Some(dir.path())), serde_json::json!(false));
+
+        // An opt-out from the old switch is a choice too.
+        let legacy = tempfile::tempdir().unwrap();
+        config::save_config_to(
+            legacy.path(),
+            &serde_json::json!({"telemetryEnabled": false}),
+        )
+        .unwrap();
+        assert_eq!(reported(Some(legacy.path())), serde_json::json!(false));
+
+        // A settings file that can't be read, or a settings folder that
+        // can't be found, keeps sync off, as startup does.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join("fleet.config.json")).unwrap();
+        assert_eq!(reported(Some(unreadable.path())), serde_json::json!(false));
+        assert_eq!(reported(None), serde_json::json!(false));
     }
     #[test]
     fn startup_restore_closes_sync_when_the_saved_choice_is_off() {

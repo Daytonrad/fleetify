@@ -552,6 +552,21 @@ pub fn has_shell_meta(s: &str) -> bool {
     s.contains("&&") || s.contains("||") || s.contains(">>") || s.contains("<<")
 }
 
+/// `git remote -v` for `diagnose_failure`'s prompt, without the credentials
+/// a remote URL can hold (`https://user:token@…`): the prompt goes to the
+/// user's AI provider. `None` when git can't list the remotes.
+async fn remotes_for_prompt(folder: &Path) -> Option<String> {
+    let (ok, out) = git_out(folder, &["remote", "-v"], Duration::from_secs(5)).await;
+    ok.then(|| git::redact_url_credentials(&out))
+}
+
+/// The error `diagnose_failure` asks about, as its prompt carries it: without
+/// the credentials a URL quoted in it can hold, as the prompt goes to the
+/// user's AI provider.
+fn error_for_prompt(message: &str) -> String {
+    git::redact_url_credentials(message)
+}
+
 pub async fn diagnose_failure(
     folder: String,
     error_message: String,
@@ -582,7 +597,8 @@ pub async fn diagnose_failure(
         Duration::from_secs(5),
     )
     .await;
-    let (rm_ok, rm_out) = git_out(&path, &["remote", "-v"], Duration::from_secs(5)).await;
+    let remotes = remotes_for_prompt(&path).await;
+    let raw_error = error_for_prompt(&error_message);
 
     let prompt = format!(
         "You are diagnosing a Git / GitHub failure inside a Fleetify session. Read the error message and the repository state below, then emit STRICT JSON with these keys:\n\n\
@@ -601,7 +617,7 @@ Rules:\n\
 - Be honest about risk. Conservative is better. The user sees the EXACT command before approving — no surprises.\n\n\
 Output ONLY the JSON object, no prose around it, no code fence.\n\n\
 # Context\n{}\n\n\
-# Raw error\n{error_message}\n\n\
+# Raw error\n{raw_error}\n\n\
 # Repo state\n\
 current branch: {}\n\n\
 ## git status -sb\n{}\n\n\
@@ -611,7 +627,7 @@ current branch: {}\n\n\
         if br_ok && !br_out.is_empty() { br_out.clone() } else { "(unknown)".to_string() },
         if st_ok { st_out } else { "(unavailable)".to_string() },
         if lg_ok { lg_out } else { "(unavailable)".to_string() },
-        if rm_ok { rm_out } else { "(unavailable)".to_string() },
+        remotes.unwrap_or_else(|| "(unavailable)".to_string()),
     );
 
     let (ok, cli, raw, err) =
@@ -860,6 +876,41 @@ mod tests {
         assert!(!ctx.uncommitted, "committed range should be used as-is");
         assert!(ctx.diff.contains("export const a = 3"));
         assert!(!ctx.log.trim().is_empty(), "commit log should be populated");
+    }
+
+    /// The failure diagnosis sends `git remote -v` to the user's AI provider.
+    #[tokio::test]
+    async fn the_diagnosis_prompt_lists_remotes_without_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        if !seed_repo(&repo).await {
+            return;
+        }
+        let origin = "https://u:t@github.com/o/r.git";
+        assert!(git_ok(&["remote", "add", "origin", origin], &repo).await);
+
+        assert_eq!(
+            remotes_for_prompt(&repo).await.as_deref(),
+            Some(
+                "origin\thttps://github.com/o/r.git (fetch)\n\
+                 origin\thttps://github.com/o/r.git (push)\n"
+            )
+        );
+    }
+
+    /// The failure diagnosis sends the error it is asked about to the user's
+    /// AI provider too, and git or gh output can quote a remote URL.
+    #[test]
+    fn the_diagnosis_prompt_carries_the_error_without_credentials() {
+        assert_eq!(
+            error_for_prompt(
+                "fatal: unable to access 'https://u:t@github.com/o/r.git/': denied\n\
+                 remote: https://token@github.com/o/r/pull/new/x"
+            ),
+            "fatal: unable to access 'https://github.com/o/r.git/': denied\n\
+             remote: https://github.com/o/r/pull/new/x"
+        );
     }
 
     /// Regression: Fleetify is Türkiye-first, so AI-written subjects are often

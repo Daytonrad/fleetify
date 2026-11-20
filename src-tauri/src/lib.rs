@@ -1,6 +1,6 @@
 //! Tauri v2 shell. `shell/` reimplements the Electron main process
-//! (Phase 1b: auth + bearer bridge + auth IPC). `setup` starts the embedded
-//! backend, the bearer bridge, and the main window.
+//! (Phase 1b: auth + auth IPC). `setup` starts the embedded backend and the
+//! main window.
 
 mod shell;
 
@@ -36,6 +36,20 @@ fn vite_port() -> u16 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK sends even the app's own page loads through the proxy in
+    // `http_proxy`/`HTTP_PROXY`, so the loopback hosts join `NO_PROXY` (read
+    // first by hyper-util) and `no_proxy` (read first by curl).
+    // Runs first: WebKit's network process copies the environment when the first webview starts.
+    #[cfg(target_os = "linux")]
+    {
+        let no_proxy = fleetify_core::loopback::no_proxy_with_loopback(
+            std::env::var("NO_PROXY").ok().as_deref(),
+            std::env::var("no_proxy").ok().as_deref(),
+        );
+        std::env::set_var("NO_PROXY", &no_proxy);
+        std::env::set_var("no_proxy", &no_proxy);
+    }
+
     // Tracing init moved into `setup()` so the file appender can use
     // Tauri's resolved `app_log_dir()` (Windows: %LOCALAPPDATA%, macOS:
     // ~/Library/Logs, Linux: ~/.local/state). The WorkerGuard returned
@@ -79,7 +93,23 @@ pub fn run() {
         }
     }
 
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    // Opening Fleetify while it runs focuses the running window
+    // (focus_main_window), and the new process exits before it opens a
+    // window or binds the backend's port. Registered before the other
+    // plugins: they set up in that order while the app is built, before
+    // setup() runs. Release builds only: debug builds share the bundle
+    // identifier the plugin keys on, and `dev:tauri:wt` runs beside
+    // `dev:tauri` by design. A cfg!() branch, not #[cfg], so debug builds
+    // still type-check the release arm.
+    let builder = tauri::Builder::default();
+    let builder = if cfg!(debug_assertions) || !single_instance_can_start() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            focus_main_window(app)
+        }))
+    };
+    let builder = builder.plugin(tauri_plugin_dialog::init());
 
     // macOS 13–15 (Ventura–Sequoia): WKWebView caps requestAnimationFrame
     // and the renderer's page-update tick at ~60 Hz regardless of the
@@ -99,6 +129,7 @@ pub fn run() {
             shell::ipc::auth_userinfo,
             shell::ipc::auth_get_access_token,
             shell::ipc::auth_get_state,
+            shell::ipc::backend_api_token,
             shell::ipc::config_get,
             shell::ipc::config_set,
             shell::ipc::telemetry_get_config,
@@ -277,6 +308,14 @@ pub fn run() {
             if let Some(guard) = shell::logging::init(app.handle()) {
                 app.manage(guard);
             }
+            // The single-instance check ran before the log was up: say here
+            // why a second launch won't find this one.
+            if !cfg!(debug_assertions) && !single_instance_can_start() {
+                tracing::warn!(
+                    "single instance is off: the D-Bus session bus address can't be read, \
+                     so opening Fleetify again won't focus this window"
+                );
+            }
 
             // Auth module emits `fleet:auth-event` via this handle.
             shell::auth::set_app_handle(app.handle().clone());
@@ -288,10 +327,15 @@ pub fn run() {
             // parsed keeps sync off and gets an explicit opt-out saved, so
             // no later save can drop the user's earlier choice. The early
             // open and the final restore below both follow this decision.
+            // Before it, the sweep removes temp files that earlier runs'
+            // unfinished saves left behind.
             let cloud_open_at_launch = app
                 .path()
                 .app_data_dir()
-                .map(|dir| shell::config::startup_cloud_decision(&dir))
+                .map(|dir| {
+                    shell::config::sweep_stale_temp_files(&dir);
+                    shell::config::startup_cloud_decision(&dir)
+                })
                 .unwrap_or(false);
 
             // One-shot lift of any plaintext `cfg.apiKeys` entries into
@@ -323,6 +367,13 @@ pub fn run() {
             let (backend_start_tx, backend_start_rx) =
                 tokio::sync::watch::channel(shell::backend_ready::BackendStart::Pending);
             shell::backend_ready::track(backend, backend_start_rx.clone());
+
+            // This run's backend API token. The backend task below starts
+            // the backend with it, and the renderer asks for it with the
+            // `backend_api_token` command, which can answer as soon as the
+            // window exists.
+            let api_token = fleetify_backend::access::ApiToken::generate();
+            app.manage(api_token.clone());
 
             // IPC from the app's origin. capabilities/default.json covers
             // only local origins (devUrl in dev mode). The origin the window
@@ -365,7 +416,9 @@ pub fn run() {
             // slow backend bind used to leave its error page on screen.
             // A start slower than 15s shows the window with the
             // placeholder ("Starting Fleetify…") until the app loads.
-            // See shell::startup_window. Direct WebviewWindow handle
+            // Once the app has loaded, the window can't navigate back to
+            // the placeholder (guard_main_navigation; it denies nothing
+            // else). See shell::startup_window. Direct WebviewWindow handle
             // clone (no get_webview_window lookup) avoids the AppHandle
             // race the earlier version hit on Windows.
             let app_url: tauri::Url = shell::startup_window::app_origin(release, backend, vite)
@@ -385,6 +438,7 @@ pub fn run() {
                 app_url.clone(),
                 app_page_loaded.clone(),
             ))
+            .on_navigation(shell::startup_window::guard_main_navigation)
             .title("Fleetify")
             // Cold-start at the ONBOARDING size (760×740) rather than
             // the MAIN size (1500×960). Reveal-when-ready paints the
@@ -450,14 +504,14 @@ pub fn run() {
             // connected. Fresh installs hand over an empty setup and
             // the backend boots with builtin + DirectGateway only.
             let addr: SocketAddr = format!("127.0.0.1:{backend}").parse().unwrap();
-            // The UI files it serves: in release, `dist` in the install's
-            // resource folder and nowhere else (shell::ui_files); in debug
-            // none, as Vite serves the UI. With no UI files to serve, the
-            // backend never starts: its task reports that as a failed
-            // start, so the window shows the error dialog and the app quits
+            // The UI files it serves: in release, the ones built into the
+            // binary and nothing else (shell::ui_files); in debug none, as
+            // Vite serves the UI. With no UI files to serve, the backend
+            // never starts: its task reports that as a failed start, so the
+            // window shows the error dialog and the app quits
             // (shell::startup_window).
             let ui_files =
-                shell::ui_files::served_ui_dir(release, || app.path().resource_dir());
+                shell::ui_files::served_ui(release, tauri::is_dev(), app.asset_resolver());
             let app_data_dir = app.path().app_data_dir().ok();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = grant {
@@ -469,8 +523,8 @@ pub fn run() {
                     ));
                     return;
                 }
-                let sd = match ui_files {
-                    Ok(sd) => sd,
+                let ui = match ui_files {
+                    Ok(ui) => ui,
                     Err(missing) => {
                         tracing::error!(
                             "the UI files are missing, so the backend won't start: {missing}"
@@ -481,9 +535,6 @@ pub fn run() {
                         return;
                     }
                 };
-                if let Some(dir) = &sd {
-                    tracing::info!("serving the UI files from {}", dir.display());
-                }
                 let routing_setup = match app_data_dir {
                     Some(dir) => {
                         let uid = shell::auth::get_user_id().await;
@@ -496,7 +547,12 @@ pub fn run() {
                         fleetify_backend::services::routing::setup::RoutingSetup::default()
                     }
                 };
-                match fleetify_backend::serve_with_routing_setup(addr, sd, routing_setup).await {
+                let opts = fleetify_backend::ServeOptions {
+                    ui,
+                    routing_setup,
+                    api_token,
+                };
+                match fleetify_backend::serve(addr, opts).await {
                     Ok(handle) => {
                         std::mem::forget(handle);
                         // backend_bind_ms splits the boot path: this is the
@@ -540,7 +596,9 @@ pub fn run() {
             // turn doesn't hit "No API key" and Settings → Models
             // opens with final pills instead of the "Testing…" flash.
             // Runs only once the embedded backend has reported its bind
-            // and answers its health route; otherwise it is skipped.
+            // and answers its health route; otherwise it is skipped. The
+            // GitHub clone token is handed over in a task of its own once
+            // the backend has bound.
             let handle = app.handle().clone();
             let warm_up_start = backend_start_rx.clone();
             tauri::async_runtime::spawn(async move {
@@ -568,12 +626,28 @@ pub fn run() {
 
                 // The warm-up sends provider keys and the internal secret, so
                 // it talks only to the app's own backend: it waits for the
-                // bind, then for the health route (200ms × 20 = 4s covers a
-                // cold Rust startup on a slow disk). A backend that fails,
-                // never reports, or doesn't answer gets nothing: before the
-                // bind, whatever answers on the port is something else. The
-                // next reload trigger (a Settings change) sends the keys.
+                // bind, then for the health route. The bind wait has no time
+                // limit of its own: it ends when the backend's task reports
+                // its start, or ends without reporting. The health wait
+                // starts right after the bind: up to 20 polls, each capped
+                // at 500 ms (backend_ready's POLL_TIMEOUT) and followed by a
+                // 200 ms pause, so at most 14 s, and a single poll when the
+                // backend answers at once. That bound is the health wait's
+                // alone: the clone-token push runs in its own task. A
+                // backend that fails, never reports, or doesn't answer gets
+                // nothing: before the bind, whatever answers on the port is
+                // something else. The next reload trigger (a Settings
+                // change) sends the keys.
                 if crate::shell::backend_ready::wait_until_bound(warm_up_start).await {
+                    // Hydrate the backend clone service with the linked
+                    // GitHub token so private-repo clones authenticate from
+                    // the first try. It is handed over in this process, not
+                    // over HTTP, so it needs the bind but not the health
+                    // route. Its own task, as reading the link can take a
+                    // while (keychain, userinfo, `gh auth token`): neither
+                    // the health wait nor the warm-up waits for it. Only the
+                    // clone routes read the token, on the user's request.
+                    tauri::async_runtime::spawn(crate::shell::github_link::push_clone_token());
                     let ready = crate::shell::backend_ready::wait_for_backend(
                         &crate::shell::backend_ready::health_url(&backend.to_string()),
                         20,
@@ -582,10 +656,6 @@ pub fn run() {
                     .await;
                     if ready {
                         crate::shell::providers_setup::warm_providers_at_boot(&handle).await;
-                        // Hydrate the backend clone service with the linked
-                        // GitHub token so private-repo clones authenticate
-                        // from the first try.
-                        crate::shell::github_link::push_clone_token().await;
                     } else {
                         tracing::warn!(
                             "backend health check timed out; skipping the provider warm-up"
@@ -596,22 +666,24 @@ pub fn run() {
                 }
 
                 // Finish the Fleetify cloud sync restore: close the gate if
-                // the launch decision kept sync off, or if the saved choice
-                // is off now (a file that can't be read or parsed counts as
+                // the launch decision kept sync off, or if no saved choice
+                // says on now (a file that can't be read or parsed counts as
                 // off). Closing also purges what is still queued, if the
                 // backend has opened its outbox by now. Nothing orders this
                 // after that, so rows older builds queued are dropped by the
                 // outbox itself. It never opens the gate, and it does
-                // nothing if Settings changed it since launch: reapplying
-                // the saved choice here would undo a switch whose save
-                // failed. (The PostHog gate was restored at the top of this
-                // task, for the same reason.)
+                // nothing if the user set it since launch (Settings, or the
+                // dashboard question): reapplying the saved choice here
+                // would undo a switch whose save failed. (The PostHog gate
+                // was restored at the top of this task, for the same
+                // reason.)
                 let saved_on = cloud_open_at_launch
                     && handle
                         .path()
                         .app_data_dir()
-                        .map(|dir| crate::shell::config::saved_cloud_choice(&dir))
-                        .unwrap_or(false);
+                        .is_ok_and(|dir| {
+                            crate::shell::config::saved_cloud_choice(&dir) == Some(true)
+                        });
                 crate::shell::ipc::finish_cloud_sync_restore(saved_on).await;
             });
 
@@ -642,14 +714,9 @@ pub fn run() {
                 boot_start,
             ));
 
-            // Loopback bearer bridge :8770 (telemetry token source / parity).
-            // FLEETIFY_NOAUTH=1 has no consumer to feed and no token to
-            // emit, so skip the listener entirely.
+            // FLEETIFY_NOAUTH=1 has only a placeholder token, nothing the
+            // cloud would accept, so the telemetry client doesn't start.
             if !shell::auth::is_no_auth() {
-                tauri::async_runtime::spawn(async {
-                    shell::bearer::run().await;
-                });
-
                 // Telemetry WS client → fleetify.dev. Bearer pulled from
                 // shell::auth.get_access_token() lazily per attempt so a
                 // mid-flow refresh is picked up at the next reconnect.
@@ -687,4 +754,314 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Brings the main window to the front when Fleetify is opened again while
+/// it runs (the single-instance plugin's callback): shown, since it starts
+/// hidden, restored if minimized, and focused. It looks the window up with
+/// `get_window`: `get_webview_window` finds a window only while every webview
+/// in it has the window's label, so not while the Browser panel's child
+/// webview is attached. Failures are logged; it never panics.
+fn focus_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_window(shell::startup_window::MAIN_WINDOW) else {
+        tracing::warn!("Fleetify was opened again, but its main window doesn't exist yet");
+        return;
+    };
+    if let Err(e) = window.show() {
+        tracing::warn!("showing the main window for a second launch failed: {e}");
+    }
+    if let Err(e) = window.unminimize() {
+        tracing::warn!("restoring the main window for a second launch failed: {e}");
+    }
+    if let Err(e) = window.set_focus() {
+        tracing::warn!("focusing the main window for a second launch failed: {e}");
+    }
+}
+
+/// Whether the single-instance plugin can be registered. On Linux it finds
+/// the running copy over the D-Bus session bus, and its setup (2.4.5)
+/// unwraps zbus's reading of that bus's address: a `DBUS_SESSION_BUS_ADDRESS`
+/// zbus can't read, such as `disabled:`, `/dev/null`, `autolaunch:` or an
+/// empty value where there is no session bus, would panic before any window
+/// exists. Without a readable address no running copy can be found anyway,
+/// so the app starts as the only one. An address that reads fine but leads
+/// to no bus is handled by the plugin: it starts the app without single
+/// instance.
+///
+/// The check reads the address with the app's own zbus, so that zbus must be
+/// the plugin's (a test checks Cargo.lock). Remove this guard, and the zbus
+/// dependency in Cargo.toml, once tauri-plugin-single-instance is 2.5.4 or
+/// later: from 2.5.4 the plugin keeps the app launching when the session bus
+/// is unavailable. 2.5.x needs tauri 2.12.
+#[cfg(target_os = "linux")]
+fn single_instance_can_start() -> bool {
+    zbus::Address::session().is_ok()
+}
+
+/// Whether the single-instance plugin can be registered: always, as it
+/// needs no D-Bus here.
+#[cfg(not(target_os = "linux"))]
+fn single_instance_can_start() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    /// lib.rs up to this module: the code the app runs, without the strings
+    /// these tests look for. LF line endings, whatever the checkout has.
+    fn app_source() -> String {
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
+        let tests = source
+            .find(&format!("#[cfg(test)]\nmod {} {{", "tests"))
+            .expect("lib.rs has this test module");
+        source[..tests].to_string()
+    }
+
+    #[test]
+    fn a_release_build_registers_the_single_instance_plugin_before_any_other() {
+        // Search strings built at run time, so this test never matches itself.
+        let source = app_source();
+        let builder = source
+            .find(&format!("tauri::Builder::{}()", "default"))
+            .expect("run() builds the app with tauri::Builder::default()");
+        let after_builder = &source[builder..];
+        let first_plugin = after_builder
+            .find(".plugin(")
+            .expect("the builder registers plugins");
+        assert!(
+            after_builder[first_plugin..].starts_with(&format!(
+                ".plugin({}::init(",
+                "tauri_plugin_single_instance"
+            )),
+            "the single-instance plugin must be the first plugin registered, so a \
+             second launch exits before any other plugin or setup runs"
+        );
+        // Gated by a cfg!(debug_assertions) branch, in its release arm: debug
+        // builds share the bundle identifier the plugin keys on, and
+        // dev:tauri:wt runs beside dev:tauri.
+        let before_plugin = &after_builder[..first_plugin];
+        let gate = before_plugin
+            .find(&format!("if cfg!({})", "debug_assertions"))
+            .expect("the plugin is gated by a cfg!(debug_assertions) branch");
+        assert!(
+            before_plugin[gate..].contains("} else {"),
+            "the plugin is registered in the release arm, not the debug one"
+        );
+    }
+
+    #[test]
+    fn the_startup_clone_token_push_runs_in_its_own_task_after_the_bind() {
+        // Reading the link can take a while (keychain, userinfo, `gh auth
+        // token`): neither the health wait nor the provider warm-up may wait
+        // for it. Whitespace removed, so line wrapping doesn't matter.
+        let source: String = app_source().split_whitespace().collect();
+        let call = format!("github_link::{}()", "push_clone_token");
+        assert_eq!(source.matches(&call).count(), 1, "run() pushes it once");
+        let spawned = format!("tauri::async_runtime::spawn(crate::shell::{call})");
+        let spawn = source
+            .find(&spawned)
+            .expect("the startup push is spawned as its own task, not awaited");
+        let bound = source
+            .find(&format!("{}(warm_up_start)", "wait_until_bound"))
+            .expect("the warm-up waits for the bind");
+        assert!(
+            bound < spawn,
+            "the push starts only once the backend has bound"
+        );
+    }
+
+    #[test]
+    fn the_main_window_has_the_navigation_guard() {
+        // Without it, the window can go back to the startup placeholder once
+        // the app has loaded, and stay there. Whitespace removed, so line
+        // wrapping doesn't matter.
+        let source: String = app_source().split_whitespace().collect();
+        let builder = source
+            .find(&format!(
+                "WebviewWindowBuilder::new(app,shell::startup_window::{},",
+                "MAIN_WINDOW"
+            ))
+            .expect("setup() builds the main window");
+        let built = builder
+            + source[builder..]
+                .find(".build()?")
+                .expect("the main window is built");
+        assert!(
+            source[builder..built].contains(&format!(
+                ".on_navigation(shell::startup_window::{})",
+                "guard_main_navigation"
+            )),
+            "the main window's builder must install guard_main_navigation"
+        );
+    }
+
+    #[test]
+    fn a_second_launch_looks_the_main_window_up_as_a_window() {
+        // get_webview_window finds a window only while every webview in it
+        // has the window's label, which the main window hasn't while the
+        // Browser panel's child webview is attached: a second launch would
+        // bring nothing to the front. Whitespace removed, so line wrapping
+        // doesn't matter.
+        let source: String = app_source().split_whitespace().collect();
+        let focus = source
+            .find(&format!(
+                "fn{}(app:&tauri::AppHandle){{",
+                "focus_main_window"
+            ))
+            .expect("lib.rs has focus_main_window");
+        let lookup = source[focus..]
+            .find("app.get_")
+            .expect("focus_main_window looks the window up");
+        assert!(
+            source[focus + lookup..].starts_with(&format!(
+                "app.{}(shell::startup_window::MAIN_WINDOW)",
+                "get_window"
+            )),
+            "focus_main_window must look the main window up with get_window"
+        );
+    }
+
+    /// The zbus `package` depends on in Cargo.lock (`lock`): the version its
+    /// dependency entry names (`"zbus 5.19.0"`, maybe with a source after
+    /// it), or, for a bare `"zbus"`, the version of the only zbus there is.
+    fn zbus_dependency(lock: &str, package: &str) -> Option<String> {
+        let value = |block: &str, key: &str| {
+            block.lines().find_map(|line| {
+                line.strip_prefix(&format!("{key} = \""))?
+                    .strip_suffix('"')
+                    .map(str::to_string)
+            })
+        };
+        let blocks: Vec<&str> = lock.split("[[package]]").collect();
+        let block = blocks
+            .iter()
+            .find(|block| value(block, "name").as_deref() == Some(package))?;
+        let named = block.lines().find_map(|line| {
+            let entry = line
+                .trim()
+                .trim_end_matches(',')
+                .strip_prefix('"')?
+                .strip_suffix('"')?;
+            let mut words = entry.split_whitespace();
+            (words.next() == Some("zbus")).then(|| words.next().map(str::to_string))
+        })?;
+        named.or_else(|| {
+            let mut versions = blocks
+                .iter()
+                .filter(|block| value(block, "name").as_deref() == Some("zbus"))
+                .filter_map(|block| value(block, "version"));
+            match (versions.next(), versions.next()) {
+                (Some(version), None) => Some(version),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn the_app_and_the_single_instance_plugin_use_the_same_zbus() {
+        // single_instance_can_start reads the session bus address with the
+        // app's zbus to tell whether the plugin's zbus can read it: that
+        // holds only while both are the same zbus.
+        let two = "[[package]]\nname = \"fleetify-app\"\ndependencies = [\n \"zbus 4.4.0\",\n]\n\n\
+                   [[package]]\nname = \"tauri-plugin-single-instance\"\n\
+                   dependencies = [\n \"tokio\",\n \"zbus 5.19.0 (registry+x)\",\n]\n";
+        assert_eq!(
+            zbus_dependency(two, "fleetify-app").as_deref(),
+            Some("4.4.0")
+        );
+        assert_eq!(
+            zbus_dependency(two, "tauri-plugin-single-instance").as_deref(),
+            Some("5.19.0")
+        );
+        let one = "[[package]]\nname = \"zbus\"\nversion = \"5.19.0\"\n\n\
+                   [[package]]\nname = \"fleetify-app\"\n\
+                   dependencies = [\n \"zbus_names\",\n \"zbus\",\n]\n";
+        assert_eq!(
+            zbus_dependency(one, "fleetify-app").as_deref(),
+            Some("5.19.0")
+        );
+
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock"),
+        )
+        .expect("read the workspace's Cargo.lock");
+        let app = zbus_dependency(&lock, "fleetify-app");
+        assert!(app.is_some(), "Cargo.lock lists fleetify-app's zbus");
+        assert_eq!(
+            app,
+            zbus_dependency(&lock, "tauri-plugin-single-instance"),
+            "fleetify-app and tauri-plugin-single-instance must use the same zbus"
+        );
+    }
+
+    /// The test below, by the name the test harness gives it.
+    #[cfg(target_os = "linux")]
+    const SESSION_BUS_TEST: &str =
+        "tests::single_instance_is_off_when_zbus_cant_read_the_session_bus_address";
+
+    /// Runs in child processes of this test binary, one per session bus
+    /// address, so no test changes this process's environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_instance_is_off_when_zbus_cant_read_the_session_bus_address() {
+        const EXPECTED: &str = "FLEETIFY_TEST_SINGLE_INSTANCE";
+        if let Ok(expected) = std::env::var(EXPECTED) {
+            // In a child: this process's environment is the case.
+            assert_eq!(super::single_instance_can_start(), expected == "on");
+            return;
+        }
+        // No bus socket in it: what zbus falls back to without an address.
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let cases = [
+            // Set when there is no session bus. zbus can't read them, and
+            // the plugin's Linux setup panics on what it can't read.
+            (Some("disabled:"), "off"),
+            (Some("/dev/null"), "off"),
+            (Some("autolaunch:"), "off"),
+            (Some(""), "off"),
+            // Read fine, though no bus answers there: the plugin then starts
+            // the app without single instance by itself.
+            (Some("unix:path=/nonexistent/fleetify-test/bus"), "on"),
+            (None, "on"),
+        ];
+        for (address, expected) in cases {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", SESSION_BUS_TEST, "--test-threads=1"])
+                .env(EXPECTED, expected)
+                .env("XDG_RUNTIME_DIR", runtime_dir.path());
+            match address {
+                Some(address) => child.env("DBUS_SESSION_BUS_ADDRESS", address),
+                None => child.env_remove("DBUS_SESSION_BUS_ADDRESS"),
+            };
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "address {address:?}: single instance should be {expected}\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// The plugin's Linux setup also unwraps the D-Bus name and object path
+    /// it builds from the bundle identifier (`com.fleetify.app`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_single_instance_dbus_name_built_from_the_identifier_is_valid() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let identifier = config["identifier"].as_str().unwrap();
+        // As the plugin builds them (platform_impl/linux.rs).
+        let name = format!("{identifier}.SingleInstance");
+        let path = format!("/{}", name.replace('.', "/").replace('-', "_"));
+        assert!(
+            zbus::names::WellKnownName::try_from(name.as_str()).is_ok(),
+            "{name}"
+        );
+        assert!(
+            zbus::zvariant::ObjectPath::try_from(path.as_str()).is_ok(),
+            "{path}"
+        );
+    }
 }

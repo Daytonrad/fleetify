@@ -6,9 +6,10 @@
 //! `X-Fleet-Internal: <secret>` header (the secret is generated at
 //! backend startup and injected into the MCP's env via
 //! `ClaudeBridge::build_mcp_config`). JWT auth is skipped — the
-//! secret is the only authenticator here, and the endpoint is
-//! intentionally not in `/api` so missing config can't accidentally
-//! expose it to a CORS-allowed renderer call.
+//! secret is the only authenticator here. These routes are mounted
+//! under `/api/internal`, which the access guard (`crate::access`)
+//! asks for no API token, so each handler's secret check is what
+//! admits a request.
 //!
 //! Faithful with the Python `dispatch_mcp.py` flow:
 //!   1. Resolve `agent` (UUID or case-insensitive title) → session_id.
@@ -28,6 +29,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::access::constant_time_eq;
 use crate::models::session::Session;
 use crate::routers::{ApiError, AppState};
 
@@ -745,19 +747,6 @@ async fn providers_warm_health(
     Ok(Json(json!({ "ok": true, "warmed": cached.len() })))
 }
 
-/// Constant-time byte-slice equality. Tiny implementation — fine for
-/// 32-byte secrets like the loopback token.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[allow(dead_code)]
 fn _silence_unused_status_code(_: StatusCode) {}
 
@@ -1122,14 +1111,6 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 400);
-    }
-
-    #[test]
-    fn constant_time_eq_handles_length_mismatch_and_match() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(constant_time_eq(b"", b""));
     }
 
     #[tokio::test]

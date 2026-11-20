@@ -12,11 +12,52 @@
 //! MCP sidecars, starts from [`http_client_builder`]. Clients that reach the
 //! internet (providers, the issuer, GitHub) don't: they keep honouring the
 //! user's proxy.
+//!
+//! WebKitGTK, the webview on Linux, sends its page loads, the app's own
+//! included, through the proxy in `http_proxy` or `HTTP_PROXY` too, unless
+//! the host is in the no-proxy list. So on Linux the shell adds the loopback
+//! hosts to `NO_PROXY` and `no_proxy` with [`no_proxy_with_loopback`] before
+//! the first webview starts. The processes the app starts inherit the list.
 
 /// A reqwest client builder for calls to a service the app runs on this
 /// machine. It never uses a proxy, whatever the environment says.
 pub fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().no_proxy()
+}
+
+/// The hosts the app's own services are reached at, as no-proxy entries.
+pub const LOOPBACK_NO_PROXY: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// A no-proxy list that keeps the user's entries and adds
+/// [`LOOPBACK_NO_PROXY`].
+///
+/// It holds the entries of `upper` (`NO_PROXY`), then those of `lower`
+/// (`no_proxy`), then the loopback hosts, joined with `,`. Entries are
+/// trimmed and ASCII-lowercased, and empty or repeated ones are dropped.
+/// Lowercase is the form that matches: libproxy compares host names
+/// case-sensitively, and a parsed URL's host is lowercase.
+///
+/// If either list has an entry that is exactly `*`, the result is `*` alone.
+/// That already exempts every host, and curl (git too) treats the list as
+/// match-all only when the whole value is `*`.
+pub fn no_proxy_with_loopback(upper: Option<&str>, lower: Option<&str>) -> String {
+    let listed: Vec<&str> = upper
+        .into_iter()
+        .chain(lower)
+        .flat_map(|list| list.split(','))
+        .map(str::trim)
+        .collect();
+    if listed.contains(&"*") {
+        return "*".to_owned();
+    }
+    let mut entries: Vec<String> = Vec::new();
+    for entry in listed.into_iter().chain(LOOPBACK_NO_PROXY) {
+        let entry = entry.to_ascii_lowercase();
+        if !entry.is_empty() && !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries.join(",")
 }
 
 #[cfg(test)]
@@ -88,7 +129,19 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // The parent picked the proxy's port by binding it and letting it
+            // go, so the OS may hand that same port to this server. A second
+            // bind made while the first listener still holds it gets another.
+            let proxy = std::env::var("HTTP_PROXY").unwrap();
+            let proxy_port = reqwest::Url::parse(&proxy).unwrap().port().unwrap();
+            let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = if first.local_addr().unwrap().port() == proxy_port {
+                let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                drop(first);
+                second
+            } else {
+                first
+            };
             let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
             tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
@@ -112,5 +165,74 @@ mod tests {
             let response = client.get(&url).send().await.expect("the request failed");
             assert_eq!(response.text().await.unwrap(), "loopback");
         });
+    }
+
+    #[test]
+    fn no_proxy_without_a_list_is_the_loopback_hosts() {
+        assert_eq!(
+            no_proxy_with_loopback(None, None),
+            "localhost,127.0.0.1,::1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_keeps_the_users_entries_first() {
+        assert_eq!(
+            no_proxy_with_loopback(Some("corp.example"), None),
+            "corp.example,localhost,127.0.0.1,::1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_takes_the_upper_case_list_then_the_lower_case_one() {
+        assert_eq!(
+            no_proxy_with_loopback(Some("a"), Some("b")),
+            "a,b,localhost,127.0.0.1,::1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_trims_entries_and_drops_empty_and_repeated_ones() {
+        assert_eq!(
+            no_proxy_with_loopback(Some(" localhost , 127.0.0.1,,x "), None),
+            "localhost,127.0.0.1,x,::1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_with_a_wildcard_is_the_wildcard_alone() {
+        assert_eq!(no_proxy_with_loopback(Some("*"), None), "*");
+    }
+
+    #[test]
+    fn no_proxy_with_a_wildcard_among_other_entries_is_the_wildcard_alone() {
+        assert_eq!(no_proxy_with_loopback(Some("a, * ,b"), Some("c")), "*");
+        assert_eq!(no_proxy_with_loopback(Some("a"), Some(" * ")), "*");
+    }
+
+    #[test]
+    fn no_proxy_treats_a_wildcard_inside_an_entry_as_an_ordinary_entry() {
+        assert_eq!(
+            no_proxy_with_loopback(Some("*.corp.example"), None),
+            "*.corp.example,localhost,127.0.0.1,::1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_lowercases_entries_so_a_repeat_in_another_case_is_dropped() {
+        assert_eq!(
+            no_proxy_with_loopback(Some("LOCALHOST"), None),
+            "localhost,127.0.0.1,::1"
+        );
+        assert_eq!(
+            no_proxy_with_loopback(Some("Corp.Example,LOCALHOST"), Some("corp.example,::1")),
+            "corp.example,localhost,::1,127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn no_proxy_is_unchanged_when_both_variables_already_hold_it() {
+        let set = "corp.example,localhost,127.0.0.1,::1";
+        assert_eq!(no_proxy_with_loopback(Some(set), Some(set)), set);
     }
 }

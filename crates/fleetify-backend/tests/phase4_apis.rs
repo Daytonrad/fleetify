@@ -5,10 +5,12 @@
 //! Same RSA + mock-JWKS pattern as sessions_api.rs so the same set of
 //! integration deps are shared.
 
-use std::net::SocketAddr;
+mod common;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use common::TestServer;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -50,6 +52,10 @@ async fn phase4_apis_smoke() {
     });
     std::env::set_var("FLEETIFY_ISSUER", format!("http://{jwks_addr}"));
     std::env::set_var("FLEET_DB_URL", "sqlite::memory:");
+    // Plugins and workflows are read from FLEETIFY_HOME: an empty temp dir
+    // keeps the test off the developer's real ~/.fleetify.
+    let fleetify_home = tempfile::tempdir().unwrap();
+    std::env::set_var("FLEETIFY_HOME", fleetify_home.path());
 
     // 3. Mint a JWT for user "u".
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -66,12 +72,11 @@ async fn phase4_apis_smoke() {
     let token = encode(&header, &claims, &key).unwrap();
     let auth = format!("Bearer {token}");
 
-    // 4. Start backend on an ephemeral port.
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let handle = fleetify_backend::serve(addr, None).await.unwrap();
-    let base = format!("http://{}", handle.local_addr());
+    // 4. Start backend on an ephemeral port. Its client sends the API token.
+    let server = TestServer::start().await;
+    let base = server.url("");
 
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // ── /api/marketplace/sources auto-seeds Fleetify Official on first hit ──
     let r = client
@@ -163,7 +168,8 @@ async fn phase4_apis_smoke() {
         .unwrap();
     assert_eq!(r.status(), 200);
 
-    // ── /api/plugins/install requires repo_url ──
+    // ── /api/plugins/install addresses a plugin by source_id + scope ──
+    // The old `{repo_url}` body no longer deserializes.
     let r = client
         .post(format!("{base}/api/plugins/install"))
         .header("Authorization", &auth)
@@ -171,13 +177,21 @@ async fn phase4_apis_smoke() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let v: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(v["ok"], false);
-    assert!(v["error"]
-        .as_str()
-        .unwrap()
-        .contains("repo_url is required"));
+    assert_eq!(r.status(), 422);
+
+    // A source the caller has no row for (the one deleted above) is a 404.
+    let r = client
+        .post(format!("{base}/api/plugins/install"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({
+            "source_id": source_id,
+            "scope": { "scope_type": "user" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    assert!(r.text().await.unwrap().contains("not found"));
 
     // ── /api/workflows lists 0 (no plugins installed in test home) ──
     let r = client

@@ -20,6 +20,10 @@ fleetify-core.workspace = true
 fleetify-backend.workspace = true
 tauri = { version = "2", features = ["macos-private-api", "image-png", "unstable"] }
 tauri-plugin-dialog = "2"
+# Opening Fleetify while it runs focuses the running window instead of
+# starting a second copy (release builds only, see lib.rs). Cargo.lock holds
+# 2.4.5, the newest release that works with tauri 2.11: 2.5 needs tauri 2.12.
+tauri-plugin-single-instance = "2"
 tokio.workspace = true
 tracing.workspace = true
 # Workspace already pins tracing-subscriber@0.3 with env-filter + json
@@ -41,6 +45,9 @@ base64 = "0.22"
 rand = "0.8"
 tiny_http = "0.12"
 url = "2"
+# Decodes the request paths the embedded UI files are looked up by
+# (shell::ui_files). Already in the tree through url and tauri.
+percent-encoding = "2"
 arboard = "3"
 portable-pty = "0.9"
 # `shell_install_provider` resolves the user's Python via PATHEXT-aware
@@ -83,11 +90,18 @@ tauri-plugin-macos-fps = "0.1"
 # lockfile via tao/wry.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-dl = "2"
+# The single-instance plugin's D-Bus library, so lib.rs can check that it
+# reads the session bus address before registering the plugin, whose Linux
+# setup panics when it can't. Keep it on the plugin's zbus version (a test in
+# lib.rs checks Cargo.lock). Remove it, with that check, once
+# tauri-plugin-single-instance is 2.5.4 or later.
+zbus = "5.9"
 
 [dev-dependencies]
 tempfile = "3"
 # The vendored runtime (root Cargo.toml's [patch.crates-io]), for the tests of
-# its postMessage IPC patch (vendor/tauri-runtime-wry/FLEETIFY_PATCH.md).
+# its postMessage IPC and IPC-free Browser panel patches
+# (vendor/tauri-runtime-wry/FLEETIFY_PATCH.md).
 # No features: tauri enables the ones it needs.
 tauri-runtime-wry = { version = "2", default-features = false }
 

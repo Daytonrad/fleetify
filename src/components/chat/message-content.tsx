@@ -17,13 +17,14 @@ import { SpawnFormCard } from "./spawn-form-card";
 import { ChatError } from "./chat-error";
 import { LogoMark } from "@/components/brand/logo-mark";
 import { ChevronRight, Copy, Check, ArrowRightLeft, CheckCircle2, AlertCircle, Terminal, FileText, Globe, Search, Cpu, CheckSquare, FolderSearch, Pencil, Wrench, Brain, MoveHorizontal, Trash2, FolderOpen, Download, Code2, BarChart2, BookOpen, Image, CornerDownLeft, Send, Bookmark, BookmarkCheck, RotateCcw, X, Clock, ArrowUp, Database } from "lucide-react";
-import { createSessionMemory } from "@/lib/api";
+import { createSessionMemory, backendFetch } from "@/lib/api";
 import { formatShortcut } from "@/lib/keyboard-shortcuts";
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { claimEscape } from "@/hooks/use-escape-to-stop";
 import { useChatStore, selectSession } from "@/stores/chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { MarkdownLink } from "@/components/markdown-link";
+import { AskImage, markdownUrlTransform } from "@/components/marketplace/detail/markdown-image";
 import { useTypewriter } from "@/hooks/use-typewriter";
 import { highlightToHtml, highlightLines, langFromPath } from "@/lib/shiki";
 import { folderName } from "@/lib/utils";
@@ -611,7 +612,7 @@ function ReadFilePreview({ filePath }: { filePath: string }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/fs/file?path=${encodeURIComponent(filePath)}`)
+    backendFetch(`/api/fs/file?path=${encodeURIComponent(filePath)}`)
       .then((r) => r.json())
       .then((j: { content?: string; error?: string }) => {
         if (cancelled) return;
@@ -1035,6 +1036,8 @@ const mdComponents: Components = {
     );
   },
   strong({ children }) { return <strong style={{ fontWeight: 600, color: "var(--c-high)" }}>{children}</strong>; },
+  // A remote image loads only after a click.
+  img: AskImage,
   // `a` is intentionally NOT defined here — MarkdownBody injects a
   // store-aware version so file-shaped hrefs can route to openFile()
   // instead of opening externally.
@@ -1240,7 +1243,9 @@ function MarkdownBodyInner({ text }: { text: string }) {
 
   return (
     <div style={{ color: "var(--foreground)" }}>
-      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={components}>{stripInternalTokens(text)}</ReactMarkdown>
+      {/* markdownUrlTransform keeps a `data:` image, which react-markdown's
+          default drops. */}
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={components} urlTransform={markdownUrlTransform}>{stripInternalTokens(text)}</ReactMarkdown>
     </div>
   );
 }
