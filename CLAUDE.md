@@ -94,6 +94,7 @@ npx tsc -b tsconfig.build.json --noEmit                 # type-check            
 npm test                                                # vitest (renderer)             (advisory)
 python3 -c "import yaml"                                # PyYAML for the script tests   (HARD gate)
 node --test "scripts/ci/*.test.mjs" "scripts/release/*.test.mjs"   # script tests (HARD gate)
+actionlint                                              # workflow lint (+ shellcheck)  (HARD gate)
 ```
 
 Run all of these locally **before pushing**. CI runs the same set on every PR,
@@ -101,6 +102,10 @@ plus `cargo audit` and `npm audit --omit=dev`, both advisory. The Rust steps run
 on Windows in CI, and clippy runs on Linux and macOS as well, so code behind one
 OS's `cfg`, such as `cfg(windows)`, is compiled and linted even when your machine
 skips it.
+
+A PR that changes what a release build reads (the paths in
+`.github/workflows/release-dry-run.yml`) also runs the release dry run, advisory:
+it builds, assembles and smoke-tests the bundles on every platform.
 
 The script tests read YAML with Python 3 and PyYAML (`python3-yaml` on Debian and
 Ubuntu, `pip install pyyaml` elsewhere). Without PyYAML those checks skip on your
@@ -269,7 +274,7 @@ each one sends.
 - **Code:** backend module at `crates/fleetify-backend/src/services/telemetry/posthog/`; frontend wrapper at `src/lib/posthog.ts`.
 - **Fan-out:** the existing `services/telemetry/emitters.rs::enqueue_payload` writes to both the Fleetify cloud outbox AND the PostHog outbox (the latter via `posthog::enqueue_if_enabled`, gated on a runtime `AtomicBool`).
 - **distinct_id:** the persisted `device_id` from `device.json` is reused on both sides. Frontend `posthog.identify(user_id)` runs at sign-in, at each launch while signed in, and at opt-in, and only while product analytics is on; it merges the anonymous person into the authenticated one via `$anon_distinct_id`, with the id only (`before_send` strips `$set` / `$set_once`).
-- **Env keys:** `POSTHOG_API_KEY` (Rust, runtime `std::env::var`) and `VITE_POSTHOG_KEY` (Vite, `import.meta.env`). Unset → backend `init` short-circuits and the renderer wrapper no-ops. `POSTHOG_HOST` / `VITE_POSTHOG_HOST` default to `https://eu.i.posthog.com`.
+- **Env keys:** `POSTHOG_API_KEY` / `POSTHOG_HOST` (Rust: runtime `std::env::var`, else the value compiled in with `option_env!`) and `VITE_POSTHOG_KEY` / `VITE_POSTHOG_HOST` (Vite, `import.meta.env`, inlined at build time). CI release builds compile all four in from the repository variables, so they carry the public, write-only `phc_` project key (the backend build fails on any other kind of key); product analytics still stays off until the user turns it on. A local build carries a key only if its environment (or, for the renderer, `.env`) sets one while it builds. No key → backend `init` short-circuits and the renderer wrapper no-ops. Both hosts default to `https://eu.i.posthog.com`.
 - **Runtime gate:** `telemetry_set_posthog_enabled` Tauri command persists the flag in `fleet.config.json::telemetry.posthog_enabled` AND flips the backend's `ENABLED` atomic live. Live opt-out stops new sends within ~10 s; the renderer's `optOut()` opts posthog-js out at once and drops every request it would still make, queued events and retries included.
 
 ### Local dev
@@ -284,7 +289,7 @@ POSTHOG_HOST=https://eu.i.posthog.com
 VITE_POSTHOG_HOST=https://eu.i.posthog.com
 ```
 
-Then just run `npm run dev:tauri:wt` — no shell env juggling, no `cargo clean` needed because the keys are read at runtime now (was `option_env!` baked-at-compile, dropped in favour of runtime resolution). Shell-set env vars still win over `.env`. Release builds never load `.env`, and the backend reads `POSTHOG_API_KEY` only from the process environment, so a release build's backend sends PostHog events only when that variable is set in the environment Fleetify starts in. `VITE_POSTHOG_KEY`, by contrast, is compiled into the renderer when the UI is built.
+Then just run `npm run dev:tauri:wt` — no shell env juggling, no `cargo clean` needed because the backend reads the keys at runtime first (a value compiled in with `option_env!` is only the fallback). Shell-set env vars still win over `.env`. Release builds never load `.env`. CI release builds carry the key and host compiled in from the repository variables (`option_env!` in the backend, Vite's inlining in the renderer), and a `POSTHOG_API_KEY` / `POSTHOG_HOST` set in the environment Fleetify starts in wins over the backend's compiled-in pair. Either way, nothing is sent until the user turns product analytics on.
 
 ### Full event list
 
