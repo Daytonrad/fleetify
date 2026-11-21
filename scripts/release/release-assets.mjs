@@ -1,17 +1,18 @@
 /**
  * release-assets.mjs — what a Fleetify release is made of: the targets CI
  * builds, the files each build produces and the names they are published
- * under, the updater manifest (latest.json), how an update endpoint picks an
- * entry from it, and SHA256SUMS.
+ * under, the install scripts, the updater manifest (latest.json), how an
+ * update endpoint picks an entry from it, and SHA256SUMS.
  *
  * The release scripts and workflows import these, so each name is defined in
- * one place. Workflow steps read two lists through the CLI:
+ * one place. Workflow steps read three lists through the CLI:
  *
  *   node scripts/release/release-assets.mjs unsigned <triple> <version>
  *   node scripts/release/release-assets.mjs updaters <triple> <version>
+ *   node scripts/release/release-assets.mjs expected <version>
  *
- * which print unsignedAssets() and updaterAssets(), one name a line (exit 0;
- * 1 for an unknown triple or a bad version; 2 usage).
+ * which print unsignedAssets(), updaterAssets() and expectedAssets(), one
+ * name a line (exit 0; 1 for an unknown triple or a bad version; 2 usage).
  *
  * Asset names are the Tauri CLI's own (tauri-cli 2.11.2), with one exception:
  * both macOS builds write macos/Fleetify.app.tar.gz, so the updater archive is
@@ -35,6 +36,14 @@ export const MANIFEST = "latest.json";
 export const CHECKSUMS = "SHA256SUMS";
 export const NOTICES = "THIRD-PARTY-NOTICES";
 export const LIBRARY_LIST = "LINUX-APPIMAGE-LIBRARIES.txt";
+
+/**
+ * The install scripts, scripts/release/install.sh and install.ps1, which a
+ * release carries under their own names: assemble.mjs adds them (--extra).
+ * Each installs the release's file for the machine it runs on, once the file
+ * matches its line in SHA256SUMS.
+ */
+export const INSTALL_SCRIPTS = Object.freeze(["install.sh", "install.ps1"]);
 
 /**
  * The release targets: the Rust target triple, the GitHub runner that builds
@@ -181,7 +190,7 @@ export function updaterAssets(triple, version) {
 
 /**
  * Every asset of a release, sorted: each target's bundle files, the AppImage
- * library list, the notices, latest.json and SHA256SUMS.
+ * library list, the notices, the install scripts, latest.json and SHA256SUMS.
  *
  * @param {string} version
  * @returns {string[]}
@@ -192,6 +201,7 @@ export function expectedAssets(version) {
     ...TARGETS.flatMap(({ triple }) => bundleFiles(triple, version).map(({ to }) => to)),
     LIBRARY_LIST,
     NOTICES,
+    ...INSTALL_SCRIPTS,
     MANIFEST,
     CHECKSUMS,
   ];
@@ -367,18 +377,26 @@ export function sha256sums(entries) {
     .join("");
 }
 
-const CLI_LISTS = { unsigned: unsignedAssets, updaters: updaterAssets };
-const USAGE = "usage: node scripts/release/release-assets.mjs unsigned|updaters <triple> <version>";
+/** Each list the CLI prints, by name, and the arguments it takes. */
+const CLI_LISTS = {
+  unsigned: { list: unsignedAssets, args: 2 },
+  updaters: { list: updaterAssets, args: 2 },
+  expected: { list: expectedAssets, args: 1 },
+};
+const USAGE = [
+  "usage: node scripts/release/release-assets.mjs unsigned|updaters <triple> <version>",
+  "       node scripts/release/release-assets.mjs expected <version>",
+].join("\n");
 
 function main(argv) {
-  const [list, triple, version] = argv;
-  if (argv.length !== 3 || !Object.hasOwn(CLI_LISTS, list)) {
+  const [name, ...args] = argv;
+  if (!Object.hasOwn(CLI_LISTS, name ?? "") || args.length !== CLI_LISTS[name].args) {
     process.stderr.write(`release-assets: ${argv.length === 0 ? "nothing to list" : `can't list ${argv.join(" ")}`}\n${USAGE}\n`);
     return 2;
   }
   let names;
   try {
-    names = CLI_LISTS[list](triple, version);
+    names = CLI_LISTS[name].list(...args);
   } catch (err) {
     process.stderr.write(`release-assets: ${err.message}\n`);
     return 1;

