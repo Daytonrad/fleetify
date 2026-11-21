@@ -7,6 +7,7 @@ import { NewAgentView } from "@/components/agent/new-agent-dialog";
 import { FirstLaunchTour } from "@/components/onboarding/first-launch-tour";
 import { WindowsTitleBar } from "./windows-title-bar";
 import { KeychainWarningBanner } from "./keychain-warning-banner";
+import { UpdateBannerSlot } from "./update-ready-banner";
 import { StudioSession } from "@/components/studio/StudioSession";
 import { StudioComposer } from "@/components/studio/StudioComposer";
 import { isStudioTool } from "@/lib/studio-tools";
@@ -448,6 +449,11 @@ export function AppShell({ introReveal = false }: { introReveal?: boolean }) {
       {/* Full-width warning when the sign-in could not be saved to the OS
           keychain; renders nothing otherwise. */}
       <KeychainWarningBanner />
+
+      {/* The place for the update banner (Restart to update). App mounts the
+          banner itself, once, so it shows before sign-in too, and renders it
+          here while this shell shows. */}
+      <UpdateBannerSlot />
 
       <div style={{
         display: "flex",

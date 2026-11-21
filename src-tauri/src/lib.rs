@@ -50,6 +50,13 @@ pub fn run() {
         std::env::set_var("no_proxy", &no_proxy);
     }
 
+    // The updater plugin sets SSL_CERT_FILE and SSL_CERT_DIR to Debian's
+    // paths when they are unset, and the processes the app starts inherit
+    // them. This sets them to this system's paths first. Before the Tauri
+    // builder: while this thread is the only one, setting a variable is sound.
+    #[cfg(target_os = "linux")]
+    shell::updater::set_system_cert_env();
+
     // Tracing init moved into `setup()` so the file appender can use
     // Tauri's resolved `app_log_dir()` (Windows: %LOCALAPPDATA%, macOS:
     // ~/Library/Logs, Linux: ~/.local/state). The WorkerGuard returned
@@ -110,6 +117,9 @@ pub fn run() {
         }))
     };
     let builder = builder.plugin(tauri_plugin_dialog::init());
+    // In-app updates. The shell drives the plugin (shell::updater) through
+    // its own commands; no capability grants the plugin's.
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     // macOS 13–15 (Ventura–Sequoia): WKWebView caps requestAnimationFrame
     // and the renderer's page-update tick at ~60 Hz regardless of the
@@ -258,6 +268,9 @@ pub fn run() {
             shell::ipc::logs_export,
             shell::ipc::logs_open_folder,
             shell::ipc::feedback_send,
+            shell::updater::updater_status,
+            shell::updater::updater_check,
+            shell::updater::updater_restart,
         ])
         .manage(shell::voice::VoiceCaptureState(std::sync::Arc::new(
             tokio::sync::Mutex::new(None),
@@ -374,6 +387,13 @@ pub fn run() {
             // window exists.
             let api_token = fleetify_backend::access::ApiToken::generate();
             app.manage(api_token.clone());
+
+            // In-app updates (shell::updater): a release build checks 10 s
+            // after launch and every 6 h while automatic updates are on,
+            // downloads in the background, and installs on Restart to update.
+            // Debug builds never check.
+            app.manage(shell::updater::UpdaterState::new(!cfg!(debug_assertions)));
+            shell::updater::spawn_auto_updates(app.handle().clone());
 
             // IPC from the app's origin. capabilities/default.json covers
             // only local origins (devUrl in dev mode). The origin the window
@@ -846,6 +866,24 @@ mod tests {
         assert!(
             before_plugin[gate..].contains("} else {"),
             "the plugin is registered in the release arm, not the debug one"
+        );
+    }
+
+    #[test]
+    fn the_certificate_variables_are_set_before_the_app_starts_a_thread() {
+        // Setting an environment variable while another thread reads the
+        // environment is a data race: run() sets these before the Tauri
+        // builder, and with it the async runtime, exists.
+        let source = app_source();
+        let set = source
+            .find(&format!("shell::updater::{}()", "set_system_cert_env"))
+            .expect("run() sets the certificate variables");
+        let builder = source
+            .find(&format!("tauri::Builder::{}()", "default"))
+            .expect("run() builds the app with tauri::Builder::default()");
+        assert!(
+            set < builder,
+            "run() must set the certificate variables before it builds the app"
         );
     }
 
