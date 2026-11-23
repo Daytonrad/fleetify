@@ -144,6 +144,13 @@ interface FleetConfig {
    *  anything but `false` counts as on. Read by the shell on every
    *  Create-PR. Settings → General → Attribution. */
   gitAttribution?: boolean;
+  /** Keep Fleetify running when its window is closed: the window hides,
+   *  and Fleetify stays in the notification area on Windows (its icon opens
+   *  the window again and quits) or in the Dock on macOS. Default true;
+   *  anything but `false` counts as on, as the shell reads it, each time the
+   *  window is closed (`keep_running_from`). Linux ignores it: closing the
+   *  window quits. Settings → General → Window. */
+  keepRunningOnClose?: boolean;
 }
 
 interface Window {
@@ -201,6 +208,11 @@ interface Window {
     setTaskbarIcon: (
       variant: "light" | "dark"
     ) => Promise<{ ok: boolean; variant?: string; error?: string }>;
+    /** Whether closing the window keeps Fleetify running here, as the
+     *  shell decides each close: on Windows only while the
+     *  notification-area icon is there, on macOS always, on Linux never.
+     *  Settings → General → Window. */
+    windowCanKeepRunning?: () => Promise<boolean>;
     setTrafficLightPosition: (x: number, y: number) => Promise<boolean>;
     minimizeWindow: () => Promise<boolean>;
     maximizeWindow: () => Promise<boolean>;

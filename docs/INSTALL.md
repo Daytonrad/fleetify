@@ -20,7 +20,7 @@ The install scripts install the latest release, or the one you name. Each downlo
 curl -fsSL https://fleetify.dev/install.sh | sh
 ```
 
-On macOS it installs Fleetify.app for your Mac, Apple silicon or Intel, into `/Applications`, or into `~/Applications` if you can't write to `/Applications`, replacing an earlier copy. On Linux it installs the AppImage as `~/.local/bin/fleetify`, with a menu entry; the AppImage needs FUSE 2, as [Linux](#linux) explains. Options go after `sh -s --`:
+On macOS it installs Fleetify.app for your Mac, Apple silicon or Intel, into `/Applications`, or into `~/Applications` if you can't write to `/Applications`, replacing an earlier copy. Quit Fleetify first, with **Fleetify → Quit Fleetify** or ⌘Q: closing its window keeps it running, and the script stops while Fleetify runs from the copy it would replace. On Linux it installs the AppImage as `~/.local/bin/fleetify`, with a menu entry; the AppImage needs FUSE 2, as [Linux](#linux) explains. Options go after `sh -s --`:
 
 ```bash
 curl -fsSL https://fleetify.dev/install.sh | sh -s -- --deb             # the .deb, through sudo apt-get
@@ -127,6 +127,15 @@ How the update installs:
 - **Windows:** Fleetify closes, the installer runs with a progress window, and then it starts Fleetify again.
 - **Linux:** the AppImage replaces itself, so keep it in a folder you own. A `.deb` or `.rpm` install updates through `dpkg` or `rpm`, which install a system package, so Linux asks for your password.
 
+## Closing the window
+
+On Windows and macOS, closing Fleetify's window keeps Fleetify running, and your agents keep working:
+
+- **Windows:** Fleetify stays in the notification area, at the right end of the taskbar, where Windows may put its icon under the **^** arrow. Click the icon to open the window again. To quit, right-click it and choose **Quit Fleetify**. The first time you close the window, Fleetify says that it is still running, and offers to quit. If Fleetify couldn't add its icon, closing the window quits it, and **Settings → General → Window** says so.
+- **macOS:** Fleetify stays in the Dock. Click its Dock icon to open the window again. To quit, press ⌘Q, or right-click the Dock icon and choose **Quit**.
+
+To make closing the window quit Fleetify, turn off **Settings → General → Window → Keep Fleetify running when you close the window**. On Linux, closing the window quits Fleetify.
+
 ## Verify a download
 
 Each release comes with a `SHA256SUMS` file, which lists the SHA-256 checksum of every file in the release, and with GitHub build provenance attestations. Releases are also immutable: once a release is published, GitHub lets no one change its files or move its tag, and it attests what the release holds. The install scripts compare the checksum for you.
@@ -164,7 +173,7 @@ Uninstalling removes the app but not your data, and it changes nothing on fleeti
 
 ### Remove your data
 
-Quit Fleetify first. Fleetify's own data, such as your sessions and chat history (`fleet.db`), your Library, installed plugins, MCP servers, device ID and telemetry queues, is in `~/.fleetify`, or in the folder `FLEETIFY_HOME` names if you set it. The rest depends on your OS.
+Quit Fleetify first: on Windows and macOS, closing its window [keeps it running](#closing-the-window). Fleetify's own data, such as your sessions and chat history (`fleet.db`), your Library, installed plugins, MCP servers, device ID and telemetry queues, is in `~/.fleetify`, or in the folder `FLEETIFY_HOME` names if you set it. The rest depends on your OS.
 
 **macOS:**
 
