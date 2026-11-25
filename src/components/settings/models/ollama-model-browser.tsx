@@ -384,6 +384,16 @@ export function OllamaModelBrowser({
   }
 
   const trimmed = freeText.trim();
+  const rows = catalog.map((model) => {
+    const previous = sizeSel[model.name];
+    const size = previous && model.sizes.includes(previous) ? previous : (model.sizes[0] ?? "");
+    const target = size ? `${model.name}:${size}` : model.name;
+    return { model, size, target };
+  });
+  // A catalog refresh can remove the row or change the tag while a pull runs.
+  const pullsOutsideRows = Object.keys(pulls).filter(
+    (target) => target !== trimmed && !rows.some((row) => row.target === target),
+  );
 
   return (
     <div style={{ padding: "14px 0 2px 0", borderTop: "1px solid var(--c-brd)" }}>
@@ -403,11 +413,7 @@ export function OllamaModelBrowser({
 
       {/* Curated rows — hairline separators, no filled boxes. */}
       <div style={{ marginTop: 6 }}>
-        {catalog.map((m, i) => {
-          const hasSizes = m.sizes.length > 0;
-          const previous = sizeSel[m.name];
-          const sel = previous && m.sizes.includes(previous) ? previous : (m.sizes[0] ?? "");
-          const target = hasSizes ? `${m.name}:${sel}` : m.name;
+        {rows.map(({ model: m, size, target }, i) => {
           const pulling = !!pulls[target];
           return (
             <div
@@ -434,11 +440,11 @@ export function OllamaModelBrowser({
               </div>
               <div style={{ fontSize: 11, color: "var(--c-low)", marginTop: 3 }}>{m.blurb}</div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-                {hasSizes && !pulling && (
+                {m.sizes.length > 0 && !pulling && (
                   <div style={{ position: "relative", display: "inline-flex", flexShrink: 0 }}>
                     <select
                       aria-label={`Size for ${m.name}`}
-                      value={sel}
+                      value={size}
                       onChange={(e) => setSizeSel((s) => ({ ...s, [m.name]: e.target.value }))}
                       style={selectStyle}
                     >
@@ -471,6 +477,14 @@ export function OllamaModelBrowser({
             </div>
           );
         })}
+        {pullsOutsideRows.map((target) => (
+          <div key={target} style={{ padding: "10px 0", borderTop: "1px solid var(--c-brd)" }}>
+            <div style={{ fontSize: 12, color: "var(--c-high)", fontFamily: "var(--font-mono, monospace)" }}>
+              {target}
+            </div>
+            <div style={{ marginTop: 8 }}>{renderAction(target)}</div>
+          </div>
+        ))}
       </div>
 
       {/* Free-text pull — any model:tag, kept as a quiet affordance below the
