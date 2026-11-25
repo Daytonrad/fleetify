@@ -40,8 +40,7 @@ interface CuratedModel {
 }
 
 // Baked curated catalog. These are real models from the Ollama library.
-// TODO: source from remote catalog (keep the free-text box either way so any
-// `model:tag` remains pullable).
+// Offline fallback while the remote catalog is unavailable.
 const CURATED_LOCAL_MODELS: CuratedModel[] = [
   { name: "llama3.2", blurb: "Meta's compact general-purpose model", caps: ["tools"], sizes: ["1b", "3b"] },
   { name: "llama3.1", blurb: "Meta's flagship general model", caps: ["tools"], sizes: ["8b", "70b"] },
@@ -173,6 +172,26 @@ export function OllamaModelBrowser({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [sizeSel, setSizeSel] = useState<Record<string, string>>({});
   const [freeText, setFreeText] = useState("");
+  const [catalog, setCatalog] = useState(CURATED_LOCAL_MODELS);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void providersApi.ollamaSuggestions(controller.signal).then((suggestions) => {
+      if (controller.signal.aborted || suggestions.length === 0) return;
+      const models = [...suggestions]
+        .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
+        .map((model): CuratedModel => {
+          const caps: Cap[] = [];
+          if (model.modalities?.input.includes("image")) caps.push("vision");
+          if (model.tool_call) caps.push("tools");
+          if (model.reasoning) caps.push("thinking");
+          if (model.modalities?.output.includes("embedding")) caps.push("embedding");
+          return { name: model.id, blurb: model.note ?? "", caps, sizes: model.tags ?? [] };
+        });
+      setCatalog(models);
+    });
+    return () => controller.abort();
+  }, []);
 
   // Keep the latest onChanged reachable from the once-subscribed progress
   // callback without re-subscribing on every render.
@@ -384,9 +403,10 @@ export function OllamaModelBrowser({
 
       {/* Curated rows — hairline separators, no filled boxes. */}
       <div style={{ marginTop: 6 }}>
-        {CURATED_LOCAL_MODELS.map((m, i) => {
+        {catalog.map((m, i) => {
           const hasSizes = m.sizes.length > 0;
-          const sel = sizeSel[m.name] ?? m.sizes[0] ?? "";
+          const previous = sizeSel[m.name];
+          const sel = previous && m.sizes.includes(previous) ? previous : (m.sizes[0] ?? "");
           const target = hasSizes ? `${m.name}:${sel}` : m.name;
           const pulling = !!pulls[target];
           return (
