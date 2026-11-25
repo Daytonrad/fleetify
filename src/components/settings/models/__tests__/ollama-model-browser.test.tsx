@@ -47,6 +47,17 @@ beforeEach(() => {
 });
 
 describe("OllamaModelBrowser", () => {
+  it("pulls a selected tag from a current curated model", async () => {
+    render(<OllamaModelBrowser baseUrl={null} installed={[]} onChanged={() => {}} />);
+
+    fireEvent.change(screen.getByLabelText("Size for qwen3.5"), {
+      target: { value: "4b" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Download qwen3.5:4b" }));
+
+    await waitFor(() => expect(apiMock.ollamaPull).toHaveBeenCalledWith("qwen3.5:4b", null));
+  });
+
   it("typing a model:tag and clicking Download starts a pull with the base URL", async () => {
     render(
       <OllamaModelBrowser
