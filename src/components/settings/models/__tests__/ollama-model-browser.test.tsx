@@ -218,7 +218,7 @@ describe("OllamaModelBrowser", () => {
     expect(screen.getByRole("textbox", { name: "Model to pull" })).toBeInTheDocument();
   });
 
-  it("keeps an active pull cancellable after its fallback row is replaced", async () => {
+  it("keeps progress, errors, and retry available after a fallback row is replaced", async () => {
     let publish!: (suggestions: OllamaSuggestion[]) => void;
     apiMock.ollamaSuggestions.mockReturnValue(new Promise<OllamaSuggestion[]>((resolve) => {
       publish = resolve;
@@ -230,6 +230,12 @@ describe("OllamaModelBrowser", () => {
     await act(async () => publish([{ id: "new-model", tags: ["2b"] }]));
     expect(screen.getByRole("button", { name: "Download new-model:2b" })).toBeInTheDocument();
     expect(screen.getByRole("progressbar", { name: "Pulling llama3.2:1b" })).toBeInTheDocument();
+    act(() => progressCb?.({ model: "llama3.2:1b", status: "error", error: "Registry unavailable" }));
+    expect(screen.getByText("Registry unavailable")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Download llama3.2:1b" }));
+    await waitFor(() => expect(apiMock.ollamaPull).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Registry unavailable")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Cancel llama3.2:1b" }));
     await waitFor(() => expect(apiMock.ollamaPullCancel).toHaveBeenCalledWith("llama3.2:1b"));
     expect(screen.queryByRole("button", { name: "Cancel llama3.2:1b" })).not.toBeInTheDocument();

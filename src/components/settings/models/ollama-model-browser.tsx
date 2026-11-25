@@ -383,6 +383,14 @@ export function OllamaModelBrowser({
     );
   }
 
+  function renderError(target: string) {
+    return errors[target] && (
+      <div style={{ fontSize: 11, color: "rgb(248,113,113)", marginTop: 6 }}>
+        {errors[target]}
+      </div>
+    );
+  }
+
   const trimmed = freeText.trim();
   const rows = catalog.map((model) => {
     const previous = sizeSel[model.name];
@@ -390,8 +398,8 @@ export function OllamaModelBrowser({
     const target = size ? `${model.name}:${size}` : model.name;
     return { model, size, target };
   });
-  // A catalog refresh can remove the row or change the tag while a pull runs.
-  const pullsOutsideRows = Object.keys(pulls).filter(
+  // A catalog refresh can remove a target while its pull is running or failed.
+  const targetsOutsideRows = [...new Set([...Object.keys(pulls), ...Object.keys(errors)])].filter(
     (target) => target !== trimmed && !rows.some((row) => row.target === target),
   );
 
@@ -469,20 +477,17 @@ export function OllamaModelBrowser({
                 )}
                 {renderAction(target)}
               </div>
-              {errors[target] && (
-                <div style={{ fontSize: 11, color: "rgb(248,113,113)", marginTop: 6 }}>
-                  {errors[target]}
-                </div>
-              )}
+              {renderError(target)}
             </div>
           );
         })}
-        {pullsOutsideRows.map((target) => (
+        {targetsOutsideRows.map((target) => (
           <div key={target} style={{ padding: "10px 0", borderTop: "1px solid var(--c-brd)" }}>
             <div style={{ fontSize: 12, color: "var(--c-high)", fontFamily: "var(--font-mono, monospace)" }}>
               {target}
             </div>
             <div style={{ marginTop: 8 }}>{renderAction(target)}</div>
+            {renderError(target)}
           </div>
         ))}
       </div>
@@ -514,11 +519,7 @@ export function OllamaModelBrowser({
             </button>
           )}
         </div>
-        {trimmed && errors[trimmed] && (
-          <div style={{ fontSize: 11, color: "rgb(248,113,113)", marginTop: 6 }}>
-            {errors[trimmed]}
-          </div>
-        )}
+        {trimmed && renderError(trimmed)}
       </div>
     </div>
   );
